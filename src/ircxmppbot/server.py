@@ -1,4 +1,4 @@
-"""server 中枢：监听/认证/命令路由/shellop 确认编排/runcmd 转发/权限持久化。"""
+"""server 中枢：连接 IM（IRC/XMPP）+ 命令处理 + shellop 确认编排 + runcmd 转发 + 权限持久化。"""
 
 from __future__ import annotations
 
@@ -14,27 +14,41 @@ import yaml
 
 from .commands import COMMAND_LEVELS
 from .config import ConfigError, ConfigWatcher, load_yaml
+from .irc_session import IRCSession
+from .llm import LLMClient
 from .permissions import Permissions
 from .protocol import (
     decode_msg,
     encode_msg,
-    make_command_result,
     make_getroot,
-    make_permission_update,
     make_runcmd,
-    make_shellop_proposal,
 )
 from .util import parse_userhost
+from .xmpp_session import XMPPSession
 
 log = logging.getLogger(__name__)
 
 AUTH_TIMEOUT = 10.0
 RUNCMD_TIMEOUT = 300.0
-REACHABILITY_TIMEOUT = 2.0  # shellop 收集可达投票人窗口（秒）
+
+
+class ChatTarget:
+    """命令回复目标抽象：IRCSession/XMPPSession 实现。"""
+
+    session_type = ""
+
+    async def reply(self, text: str, channel: str | None, private_to: str | None = None) -> None:
+        raise NotImplementedError
+
+    async def execute(self, action: str, action_args: list[str], channel: str | None) -> None:
+        raise NotImplementedError
+
+    async def dm_voters(self, proposal_id, candidate, voters, deadline_ts) -> list[str]:
+        return []
 
 
 class ClientConnection:
-    """一条已认证的 client 连接。"""
+    """一条已认证的 client（shell 执行器）连接。"""
 
     def __init__(self, reader, writer, client_name: str, client_type: str, bot_name: str) -> None:
         self.reader = reader
@@ -49,7 +63,7 @@ class ClientConnection:
 
 
 class BotServer:
-    """权威权限中枢。"""
+    """权威权限中枢 + IM 会话宿主。"""
 
     def __init__(self, config_path: Path) -> None:
         self.config_path = Path(config_path)
@@ -59,9 +73,12 @@ class BotServer:
         # userhost -> (is_oper, monotonic_ts)
         self.oper_cache: dict[str, tuple[bool, float]] = {}
         self.proposals: dict[str, dict] = {}
-        # task_id -> (future, origin_conn, caller, target_client_name)
-        self.runcmd_pending: dict[str, tuple[asyncio.Future, ClientConnection, str, str]] = {}
+        # task_id -> (future, origin_target, caller, target_client_name)
+        self.runcmd_pending: dict[str, tuple[asyncio.Future, ChatTarget, str, str]] = {}
         self._persist_lock = asyncio.Lock()
+        self.llm: LLMClient | None = None
+        self.irc_session: IRCSession | None = None
+        self.xmpp_session: XMPPSession | None = None
 
     # ---------- 配置 ----------
 
@@ -69,6 +86,7 @@ class BotServer:
         if "server" not in cfg or "permissions" not in cfg:
             raise ConfigError("server.yaml 必须包含 server 与 permissions 段")
         self.permissions = Permissions.from_config(cfg)
+        self.llm = LLMClient(cfg.get("llm", {}))
         self.cfg = cfg
         asyncio.create_task(self._broadcast_permissions())
 
@@ -91,7 +109,6 @@ class BotServer:
             cfg_dir = self.config_path.parent
             certfile = tls_cfg["certfile"]
             keyfile = tls_cfg.get("keyfile")
-            # 相对路径基于配置文件所在目录解析（避免 CWD 依赖）
             if not Path(certfile).is_absolute():
                 certfile = str(cfg_dir / certfile)
             if keyfile and not Path(keyfile).is_absolute():
@@ -100,8 +117,15 @@ class BotServer:
         server = await asyncio.start_server(self._handle_client, host, port, ssl=ssl_ctx)
         log.info("server 监听 %s:%s (TLS=%s)", host, port, ssl_ctx is not None)
         watcher = ConfigWatcher(self.config_path, self._on_config_change)
+        tasks = [asyncio.create_task(server.serve_forever()), asyncio.create_task(watcher.run())]
+        if self.cfg.get("irc"):
+            self.irc_session = IRCSession(self, self.cfg["irc"])
+            tasks.append(asyncio.create_task(self.irc_session.run()))
+        if self.cfg.get("xmpp"):
+            self.xmpp_session = XMPPSession(self, self.cfg["xmpp"])
+            tasks.append(asyncio.create_task(self.xmpp_session.run()))
         try:
-            await asyncio.gather(server.serve_forever(), watcher.run())
+            await asyncio.gather(*tasks)
         finally:
             watcher.stop()
 
@@ -111,10 +135,9 @@ class BotServer:
         except ConfigError as e:
             log.error("热重载失败: %s", e)
 
-    # ---------- 连接处理 ----------
+    # ---------- 连接处理（shell 执行器） ----------
 
     def _try_register(self, conn: ClientConnection) -> bool:
-        """注册连接；重名返回 False（拒绝），防止旧 conn 断开时误删新连接。"""
         if conn.client_name in self.conns:
             log.warning("client 重名注册被拒: %s", conn.client_name)
             return False
@@ -147,13 +170,12 @@ class BotServer:
                 await writer.drain()
                 return
             await conn.send({"type": "auth_ok", "ok": True})
-            await conn.send(self._permission_update_msg())
 
             async for raw in reader:
                 line = raw.decode("utf-8")
                 try:
                     msg = decode_msg(line)
-                except Exception as e:  # noqa: BLE001 - 协议错误不致命
+                except Exception as e:  # noqa: BLE001
                     log.warning("协议错误: %s", e)
                     continue
                 await self._dispatch(conn, msg)
@@ -161,7 +183,6 @@ class BotServer:
             pass
         finally:
             if conn is not None:
-                # H2: 仅当字典中的条目仍是本连接时才删除（防止覆盖后误删新连接）
                 if self.conns.get(conn.client_name) is conn:
                     self.conns.pop(conn.client_name, None)
                 self._drop_pending_for(conn)
@@ -172,62 +193,77 @@ class BotServer:
             except (ConnectionError, OSError):
                 pass
 
-    # ---------- 分发 ----------
-
     async def _dispatch(self, conn: ClientConnection, msg: dict) -> None:
         t = msg.get("type")
-        if t == "command":
-            await self._handle_command(conn, msg)
-        elif t == "vote":
-            await self._handle_vote(conn, msg)
-        elif t == "runcmd_result":
+        if t == "runcmd_result":
             await self._handle_runcmd_result(conn, msg)
-        elif t == "reachability":
-            await self._handle_reachability(conn, msg)
         elif t == "status":
             pass
         else:
             log.warning("未知消息类型: %s", t)
 
-    async def _handle_command(self, conn: ClientConnection, msg: dict) -> None:
-        cmd = msg.get("cmd", "")
-        args = msg.get("args", [])
-        caller = msg.get("caller_userhost", "")
-        is_oper = bool(msg.get("caller_is_oper", False))
-        channel = msg.get("channel")
-        uh = parse_userhost(caller)
+    # ---------- 命令入口（来自 IRC/XMPP 会话） ----------
+
+    async def handle_chat_command(self, cmd, args, caller_userhost, is_oper, channel, target) -> None:
+        if target.session_type == "xmpp" and cmd not in ("chat", "help"):
+            await target.reply("XMPP 端仅支持 chat 命令", channel, None)
+            return
+        uh = parse_userhost(caller_userhost)
         if uh:
             self.oper_cache[uh] = (is_oper, time.monotonic())
         required = COMMAND_LEVELS.get(cmd)
         if required is None:
-            await self._reply(conn, False, f"未知命令: {cmd}", channel, caller)
+            await target.reply(f"未知命令: {cmd}", channel, caller_userhost)
             return
         if not self.permissions.has_level(uh, required, is_oper=is_oper):
-            await self._reply(conn, False, "权限不足", channel, caller)
+            await target.reply("权限不足", channel, caller_userhost)
             return
         handler = getattr(self, f"_cmd_{cmd}", None)
         if handler is None:
-            await self._reply(conn, False, f"未知命令: {cmd}", channel, caller)
+            await target.reply(f"未知命令: {cmd}", channel, caller_userhost)
             return
-        await handler(conn, args, uh, is_oper, channel)
+        await handler(target, args, uh, is_oper, channel)
 
-    async def _reply(
-        self,
-        conn: ClientConnection,
-        ok: bool,
-        reply: str,
-        channel: str | None,
-        caller: str,
-        action: str = "none",
-        action_args: list[str] | None = None,
-    ) -> None:
-        target_type = "channel" if channel else "private"
-        target = channel or caller
-        await conn.send(make_command_result(ok, reply, target_type, target, action, action_args))
+    async def handle_join(self, target: ChatTarget, channel, nick) -> None:
+        p = self.permissions
+        if not p.whitelist_enabled and not p.blacklist_enabled:
+            return
+        info = target.users.get(nick)
+        if info:
+            hostmask = f"{nick}!{info.get('username', '*')}@{info.get('hostname', '*')}"
+        else:
+            hostmask = f"{nick}!*@*"
+        uh = parse_userhost(hostmask)
+        if p.whitelist_enabled:
+            if p.whitelist_allows(hostmask, channel):
+                return
+            if p.is_botop(uh) or target.oper_cache.get(uh, False):
+                return
+            await target.kick(channel, nick, "白名单模式")
+            return
+        if p.blacklist_blocks(hostmask, channel):
+            await target.kick(channel, nick, "黑名单")
 
     # ---------- 命令处理器 ----------
 
-    async def _cmd_info(self, conn, args, caller, is_oper, channel) -> None:
+    async def _cmd_chat(self, target, args, caller, is_oper, channel) -> None:
+        text = " ".join(args)
+        if not text:
+            await target.reply("用法: chat <文本>", channel, caller)
+            return
+        try:
+            reply = await self.llm.chat(text)
+        except Exception as e:  # noqa: BLE001 - LLM 错误不致命
+            reply = f"LLM 错误: {e}"
+        await target.reply(reply, channel, None)
+
+    async def _cmd_help(self, target, args, caller, is_oper, channel) -> None:
+        await target.reply(
+            "命令: chat/help/ban/unban/whitelist/blacklist/botop/shellop/confirm/reject/runcmd/info",
+            channel, caller,
+        )
+
+    async def _cmd_info(self, target, args, caller, is_oper, channel) -> None:
         clients = ", ".join(f"{n}({c.client_type})" for n, c in self.conns.items()) or "无"
         reply = (
             f"在线 client: {clients}\n"
@@ -237,73 +273,72 @@ class BotServer:
             f"blacklist: {'开' if self.permissions.blacklist_enabled else '关'} "
             f"({len(self.permissions.blacklist)}条)"
         )
-        await self._reply(conn, True, reply, channel, caller)
+        await target.reply(reply, channel, caller if channel is None else None)
 
-    async def _cmd_botop(self, conn, args, caller, is_oper, channel) -> None:
+    async def _cmd_botop(self, target, args, caller, is_oper, channel) -> None:
         if len(args) != 2 or args[0] not in ("give", "remove"):
-            await self._reply(conn, False, "用法: botop give/remove <user@host>", channel, caller)
+            await target.reply("用法: botop give/remove <user@host>", channel, caller)
             return
-        target = parse_userhost(args[1])
+        uh = parse_userhost(args[1])
         if args[0] == "give":
-            self.permissions.botop.add(target)
-            reply = f"已授予 botop: {target}"
+            self.permissions.botop.add(uh)
+            reply = f"已授予 botop: {uh}"
         else:
-            self.permissions.botop.discard(target)
-            reply = f"已移除 botop: {target}"
+            self.permissions.botop.discard(uh)
+            reply = f"已移除 botop: {uh}"
         await self._persist_permissions()
-        await self._reply(conn, True, reply, channel, caller)
+        await target.reply(reply, channel, caller if channel is None else None)
 
-    async def _cmd_shellop(self, conn, args, caller, is_oper, channel) -> None:
+    async def _cmd_shellop(self, target, args, caller, is_oper, channel) -> None:
         if len(args) != 2 or args[0] not in ("add", "remove"):
-            await self._reply(conn, False, "用法: shellop add/remove <user@host>", channel, caller)
+            await target.reply("用法: shellop add/remove <user@host>", channel, caller)
             return
-        target = parse_userhost(args[1])
+        uh = parse_userhost(args[1])
         if args[0] == "remove":
-            self.permissions.shellop.discard(target)
+            self.permissions.shellop.discard(uh)
             await self._persist_permissions()
-            await self._reply(conn, True, f"已移除 shellop: {target}", channel, caller)
+            await target.reply(f"已移除 shellop: {uh}", channel, caller if channel is None else None)
             return
-        # add → 确认流程
-        if target not in self.permissions.botop:
-            await self._reply(conn, False, f"候选人 {target} 不是 botop，无法提议为 shellop", channel, caller)
+        if uh not in self.permissions.botop:
+            await target.reply(f"候选人 {uh} 不是 botop，无法提议为 shellop", channel, caller)
             return
-        oper_info = self.oper_cache.get(target)
+        oper_info = self.oper_cache.get(uh)
         oper_ttl = self.oper_cache_ttl()
         oper_valid = oper_info and oper_info[0] and (time.monotonic() - oper_info[1]) <= oper_ttl
         if not oper_valid:
-            await self._reply(conn, False, f"候选人 {target} 未验证为 oper（需其 /oper 后触发机器人 WHOIS），无法提议", channel, caller)
+            await target.reply(f"候选人 {uh} 未验证为 oper（需其 /oper 后触发机器人 WHOIS），无法提议", channel, caller)
             return
-        if target in self.permissions.shellop:
-            await self._reply(conn, False, f"{target} 已是 shellop", channel, caller)
+        if uh in self.permissions.shellop:
+            await target.reply(f"{uh} 已是 shellop", channel, caller)
             return
         proposal_id = uuid.uuid4().hex[:8]
         voters = self._collect_voters()
         voters.add(caller)  # 发起者必投
         deadline_ts = time.time() + self.confirm_timeout()
-        # 问题2: 只统计可上报可达名单的 client（非 XMPP）——IRC 参与投票，XMPP 不参与
-        expected_clients = sum(1 for c in self.conns.values() if c.client_type == "irc")
         prop = {
             "proposal_id": proposal_id,
-            "candidate": target,
+            "candidate": uh,
             "deadline": time.monotonic() + self.confirm_timeout(),
-            "initial_voters": set(voters),   # 定稿前全集（用于校验上报来源）
-            "voters": voters,                # 初始全集；收集可达后定稿
-            "votes": {caller: True},         # 发起者自动同意
-            "reachable": set(),              # M8: 各 client 上报的可达投票人
-            "reach_reports": 0,
-            "reported_by": set(),            # 问题3: 已上报的 conn，防重复
-            "expected_clients": expected_clients,
-            "collecting": True,              # 收集窗口进行中
-            "origin_conn": conn,
+            "voters": voters,
+            "votes": {caller: True},  # 发起者自动同意
+            "origin_target": target,
             "origin_caller": caller,
             "origin_channel": channel,
             "task": None,
         }
         self.proposals[proposal_id] = prop
         prop["task"] = asyncio.create_task(self._proposal_timer(proposal_id))
-        prop["collect_task"] = asyncio.create_task(self._collect_reachability(proposal_id))
-        await self._broadcast_proposal(proposal_id, target, deadline_ts, sorted(voters))
-        await self._reply(conn, True, f"shellop 提议 #{proposal_id} 已创建，正在确认可触达投票人", channel, caller)
+        # 收集可达投票人（dm_voters 取代 reachability 消息）
+        reachable = await target.dm_voters(proposal_id, uh, sorted(voters), deadline_ts)
+        prop["voters"] = set(reachable) | {caller}
+        # 仅发起者一人可触达 → 直接通过
+        if len(prop["voters"]) <= 1:
+            await self._finalize_proposal(proposal_id, success=True, reason="仅发起者一人可触达，全员同意")
+            return
+        await target.reply(
+            f"shellop 提议 #{proposal_id} 已通知 {len(prop['voters'])} 位可触达投票人确认",
+            channel, caller if channel is None else None,
+        )
 
     def _collect_voters(self) -> set[str]:
         voters = set(self.permissions.botop)
@@ -314,53 +349,6 @@ class BotServer:
                 voters.add(uh)
         return voters
 
-    async def _broadcast_proposal(self, proposal_id, candidate, deadline_ts, voters) -> None:
-        msg = make_shellop_proposal(proposal_id, candidate, deadline_ts, voters)
-        for conn in list(self.conns.values()):
-            try:
-                await conn.send(msg)
-            except (ConnectionError, OSError):
-                pass
-
-    async def _collect_reachability(self, pid: str) -> None:
-        """收集各 client 上报的可达投票人，定稿 voters（M8 防死锁）。"""
-        prop = self.proposals.get(pid)
-        if prop is None:
-            return
-        deadline = time.monotonic() + REACHABILITY_TIMEOUT
-        while time.monotonic() < deadline and prop["reach_reports"] < prop["expected_clients"]:
-            await asyncio.sleep(0.1)
-        if pid not in self.proposals:
-            return
-        # 定稿 voters = 可达集合 ∪ 发起者
-        prop["voters"] = prop["reachable"] | {prop["origin_caller"]}
-        prop["collecting"] = False
-        # 若仅发起者一人（其他投票人全部不可达）→ 直接通过
-        if len(prop["voters"]) <= 1:
-            await self._finalize_proposal(pid, success=True, reason="仅发起者一人可触达，全员同意")
-            return
-        try:
-            await self._reply(prop["origin_conn"], True,
-                              f"提议 #{pid} 已通知 {len(prop['voters'])} 位可触达投票人确认",
-                              prop["origin_channel"], prop["origin_caller"])
-        except (ConnectionError, OSError):
-            pass
-
-    async def _handle_reachability(self, conn: ClientConnection, msg: dict) -> None:
-        pid = msg.get("proposal_id", "")
-        prop = self.proposals.get(pid)
-        if prop is None or not prop.get("collecting", False):
-            return
-        # 问题3: 同一 conn 只计一次
-        if conn.client_name in prop["reported_by"]:
-            return
-        # 只接受初始投票人集合内的 userhost（防伪造/扩大投票人）
-        valid = [u for u in (msg.get("reachable", []) or [])
-                 if parse_userhost(u) in prop["initial_voters"]]
-        prop["reported_by"].add(conn.client_name)
-        prop["reachable"].update(parse_userhost(u) for u in valid)
-        prop["reach_reports"] += 1
-
     async def _proposal_timer(self, proposal_id: str) -> None:
         prop = self.proposals.get(proposal_id)
         if prop is None:
@@ -370,40 +358,23 @@ class BotServer:
         if proposal_id in self.proposals:
             await self._finalize_proposal(proposal_id, success=False, reason="超时作废")
 
-    async def _handle_vote(self, conn: ClientConnection, msg: dict) -> None:
-        pid = msg.get("proposal_id", "")
-        vote = msg.get("vote", "")
-        voter = parse_userhost(msg.get("voter_userhost", ""))
-        prop = self.proposals.get(pid)
+    async def _handle_vote(self, voter: str, vote: str, proposal_id: str) -> None:
+        prop = self.proposals.get(proposal_id)
         if prop is None:
-            await self._reply(conn, False, f"提议 {pid} 不存在或已结束", None, voter)
-            return
-        if prop.get("collecting", False):
-            # 收集窗口内 voters 尚未定稿，拒绝投票（防不可达用户提前否决）
-            await self._reply(conn, False, "投票收集中，请稍候", None, voter)
-            return
-        if voter not in prop["voters"]:
-            await self._reply(conn, False, "你不是该提议的投票人", None, voter)
-            return
-        if voter in prop["votes"]:
-            await self._reply(conn, False, "你已投过票", None, voter)
             return
         if time.monotonic() > prop["deadline"]:
-            await self._finalize_proposal(pid, success=False, reason="超时作废")
-            await self._reply(conn, False, "提议已超时作废", None, voter)
+            await self._finalize_proposal(proposal_id, success=False, reason="超时作废")
+            return
+        if voter not in prop["voters"]:
             return
         if vote == "reject":
             prop["votes"][voter] = False
-            await self._finalize_proposal(pid, success=False, reason=f"{voter} 否决")
+            await self._finalize_proposal(proposal_id, success=False, reason=f"{voter} 否决")
             return
         if vote == "confirm":
             prop["votes"][voter] = True
             if len(prop["votes"]) >= len(prop["voters"]):
-                await self._finalize_proposal(pid, success=True, reason="全员同意")
-                return
-            await self._reply(conn, True, f"已记录同意 ({len(prop['votes'])}/{len(prop['voters'])})", None, voter)
-            return
-        await self._reply(conn, False, "投票值必须是 confirm/reject", None, voter)
+                await self._finalize_proposal(proposal_id, success=True, reason="全员同意")
 
     async def _finalize_proposal(self, pid: str, success: bool, reason: str) -> None:
         prop = self.proposals.pop(pid, None)
@@ -415,12 +386,6 @@ class BotServer:
                 await prop["task"]
             except asyncio.CancelledError:
                 pass
-        if prop.get("collect_task"):
-            prop["collect_task"].cancel()
-            try:
-                await prop["collect_task"]
-            except asyncio.CancelledError:
-                pass
         if success:
             self.permissions.shellop.add(prop["candidate"])
             await self._persist_permissions()
@@ -428,46 +393,46 @@ class BotServer:
         else:
             reply = f"提议 #{pid} 未通过：{reason}"
         try:
-            await self._reply(prop["origin_conn"], success, reply, None, prop["origin_caller"])
+            await prop["origin_target"].reply(reply, None, prop["origin_caller"])
         except (ConnectionError, OSError):
             pass
 
-    async def _cmd_whitelist(self, conn, args, caller, is_oper, channel) -> None:
-        await self._manage_list(conn, args, caller, channel, "whitelist")
+    async def _cmd_whitelist(self, target, args, caller, is_oper, channel) -> None:
+        await self._manage_list(target, args, caller, channel, "whitelist")
 
-    async def _cmd_blacklist(self, conn, args, caller, is_oper, channel) -> None:
-        await self._manage_list(conn, args, caller, channel, "blacklist")
+    async def _cmd_blacklist(self, target, args, caller, is_oper, channel) -> None:
+        await self._manage_list(target, args, caller, channel, "blacklist")
 
-    async def _manage_list(self, conn, args, caller, channel, which: str) -> None:
+    async def _manage_list(self, target, args, caller, channel, which: str) -> None:
         entries = self.permissions.whitelist if which == "whitelist" else self.permissions.blacklist
         other = "blacklist" if which == "whitelist" else "whitelist"
         if not args:
-            await self._reply(conn, False, f"用法: {which} add/del/list/on/off [mask] [channel]", channel, caller)
+            await target.reply(f"用法: {which} add/del/list/on/off [mask] [channel]", channel, caller)
             return
         sub = args[0]
         if sub == "list":
             if entries:
                 lines = "\n".join(f"- {e.get('mask')} {e.get('channel', '(全局)')}" for e in entries)
-                await self._reply(conn, True, f"{which} 条目:\n{lines}", channel, caller)
+                await target.reply(f"{which} 条目:\n{lines}", channel, caller if channel is None else None)
             else:
-                await self._reply(conn, True, f"{which} 为空", channel, caller)
+                await target.reply(f"{which} 为空", channel, caller if channel is None else None)
             return
         if sub == "on":
             if getattr(self.permissions, f"{other}_enabled"):
-                await self._reply(conn, False, f"{other} 已启用，{which} 与 {other} 不能同时启用", channel, caller)
+                await target.reply(f"{other} 已启用，{which} 与 {other} 不能同时启用", channel, caller)
                 return
             setattr(self.permissions, f"{which}_enabled", True)
             await self._persist_permissions()
-            await self._reply(conn, True, f"{which} 已启用", channel, caller)
+            await target.reply(f"{which} 已启用", channel, caller if channel is None else None)
             return
         if sub == "off":
             setattr(self.permissions, f"{which}_enabled", False)
             await self._persist_permissions()
-            await self._reply(conn, True, f"{which} 已禁用", channel, caller)
+            await target.reply(f"{which} 已禁用", channel, caller if channel is None else None)
             return
         if sub in ("add", "del"):
             if len(args) < 2:
-                await self._reply(conn, False, f"用法: {which} {sub} <mask> [channel]", channel, caller)
+                await target.reply(f"用法: {which} {sub} <mask> [channel]", channel, caller)
                 return
             mask = args[1]
             ch = args[2] if len(args) > 2 else None
@@ -477,86 +442,93 @@ class BotServer:
                     entry["channel"] = ch
                 entries.append(entry)
                 await self._persist_permissions()
-                await self._reply(conn, True, f"已添加 {which} 条目: {mask} {ch or '(全局)'}", channel, caller)
+                await target.reply(f"已添加 {which} 条目: {mask} {ch or '(全局)'}", channel, caller if channel is None else None)
             else:
                 for i, e in enumerate(entries):
                     if e.get("mask") == mask and e.get("channel") == ch:
                         del entries[i]
                         await self._persist_permissions()
-                        await self._reply(conn, True, f"已删除 {which} 条目: {mask}", channel, caller)
+                        await target.reply(f"已删除 {which} 条目: {mask}", channel, caller if channel is None else None)
                         return
-                await self._reply(conn, False, f"未找到条目: {mask}", channel, caller)
+                await target.reply(f"未找到条目: {mask}", channel, caller)
             return
-        await self._reply(conn, False, f"未知子命令: {sub}", channel, caller)
+        await target.reply(f"未知子命令: {sub}", channel, caller)
 
-    async def _cmd_ban(self, conn, args, caller, is_oper, channel) -> None:
+    async def _cmd_ban(self, target, args, caller, is_oper, channel) -> None:
         if not args:
-            await self._reply(conn, False, "用法: ban <nick>", channel, caller)
+            await target.reply("用法: ban <nick>", channel, caller)
             return
-        await self._reply(conn, True, f"已批准封禁 {args[0]}", channel, caller, action="ban", action_args=[args[0]])
+        await target.reply(f"已批准封禁 {args[0]}", channel, caller if channel is None else None)
+        await target.execute("ban", [args[0]], channel)
 
-    async def _cmd_unban(self, conn, args, caller, is_oper, channel) -> None:
+    async def _cmd_unban(self, target, args, caller, is_oper, channel) -> None:
         if not args:
-            await self._reply(conn, False, "用法: unban <nick>", channel, caller)
+            await target.reply("用法: unban <nick>", channel, caller)
             return
-        await self._reply(conn, True, f"已批准解封 {args[0]}", channel, caller, action="unban", action_args=[args[0]])
+        await target.reply(f"已批准解封 {args[0]}", channel, caller if channel is None else None)
+        await target.execute("unban", [args[0]], channel)
 
-    async def _cmd_runcmd(self, conn, args, caller, is_oper, channel) -> None:
+    async def _cmd_runcmd(self, target, args, caller, is_oper, channel) -> None:
         if not args:
-            await self._reply(conn, False, "用法: runcmd <client_name> <cmd...>", channel, caller)
+            await target.reply("用法: runcmd <client_name> <cmd...>", channel, caller)
             return
         if args[0] == "getroot":
-            # getroot 子命令：目标 = 调用者所在 client（发起 conn 自身）
             if len(args) < 2 or not args[1]:
-                await self._reply(conn, False, "用法: runcmd getroot <client_root_password>", channel, caller)
+                await target.reply("用法: runcmd getroot <client_root_password>", channel, caller)
                 return
             password = args[1]
             task_id = uuid.uuid4().hex
             fut: asyncio.Future = asyncio.get_running_loop().create_future()
-            self.runcmd_pending[task_id] = (fut, conn, caller, conn.client_name)
+            self.runcmd_pending[task_id] = (fut, target, caller, None)  # getroot 目标=任一执行器
+            # getroot 发往任意在线 client 执行器
+            client_name = next(iter(self.conns), None)
+            if client_name is None:
+                self.runcmd_pending.pop(task_id, None)
+                await target.reply("没有在线 client 执行器", channel, caller)
+                return
+            conn = self.conns[client_name]
+            self.runcmd_pending[task_id] = (fut, target, caller, conn.client_name)
             try:
                 await conn.send(make_getroot(task_id, password, caller))
             except (ConnectionError, OSError):
                 self.runcmd_pending.pop(task_id, None)
-                await self._reply(conn, False, "client 连接异常", channel, caller)
+                await target.reply("client 连接异常", channel, caller)
                 return
-            await self._reply(conn, True, "getroot 已发送到本 client，等待验证", channel, caller)
             try:
                 ok, output = await asyncio.wait_for(fut, timeout=RUNCMD_TIMEOUT)
             except asyncio.TimeoutError:
                 self.runcmd_pending.pop(task_id, None)
-                await self._reply(conn, False, "getroot 验证超时", None, caller)
+                await target.reply("getroot 验证超时", None, caller)
                 return
             text = output if output else ("root 已激活" if ok else "root 验证失败")
-            await conn.send(make_command_result(ok, text, "private", caller))
+            await target.reply(text, None, caller)
             return
         target_name = args[0]
         cmd = " ".join(args[1:])
-        target = self.conns.get(target_name)
-        if target is None:
-            await self._reply(conn, False, f"client {target_name} 不在线", channel, caller)
+        conn = self.conns.get(target_name)
+        if conn is None:
+            await target.reply(f"client {target_name} 不在线", channel, caller)
             return
         task_id = uuid.uuid4().hex
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
-        self.runcmd_pending[task_id] = (fut, conn, caller, target_name)
+        self.runcmd_pending[task_id] = (fut, target, caller, target_name)
         try:
-            await target.send(make_runcmd(task_id, cmd, caller_userhost=caller))
+            await conn.send(make_runcmd(task_id, cmd, caller_userhost=caller))
         except (ConnectionError, OSError):
             self.runcmd_pending.pop(task_id, None)
-            await self._reply(conn, False, f"client {target_name} 连接异常", channel, caller)
+            await target.reply(f"client {target_name} 连接异常", channel, caller)
             return
-        await self._reply(conn, True, f"runcmd 已发送到 {target_name}", channel, caller)
         try:
             ok, output = await asyncio.wait_for(fut, timeout=RUNCMD_TIMEOUT)
         except asyncio.TimeoutError:
             self.runcmd_pending.pop(task_id, None)
-            await self._reply(conn, False, f"runcmd 在 {target_name} 超时（{int(RUNCMD_TIMEOUT)}s）", None, caller)
+            await target.reply(f"runcmd 在 {target_name} 超时（{int(RUNCMD_TIMEOUT)}s）", None, caller)
             return
         if not ok:
             text = f"命令执行失败:\n{output}" if output else "命令执行失败"
         else:
             text = output if output else "命令执行成功，无输出"
-        await conn.send(make_command_result(ok, text, "private", caller))
+        await target.reply(text, None, caller)
 
     async def _handle_runcmd_result(self, conn: ClientConnection, msg: dict) -> None:
         tid = msg.get("task_id", "")
@@ -564,8 +536,7 @@ class BotServer:
         if entry is None:
             log.warning("未知 runcmd task: %s", tid)
             return
-        # M4: 校验结果发送者——只有该任务的目标 client 才能 resolve
-        fut, origin_conn, caller, target_name = entry
+        fut, origin_target, caller, target_name = entry
         if conn.client_name != target_name:
             log.warning("runcmd_result 来源不符，拒绝: task=%s from=%s target=%s", tid, conn.client_name, target_name)
             return
@@ -577,9 +548,8 @@ class BotServer:
             fut.set_result((bool(msg.get("ok")), output))
 
     def _drop_pending_for(self, conn: ClientConnection) -> None:
-        """连接断开时清理其发起的未完成 runcmd/getroot 请求。"""
-        for tid, (fut, origin_conn, _caller, _target) in list(self.runcmd_pending.items()):
-            if origin_conn is conn:
+        for tid, (fut, _origin, _caller, target_name) in list(self.runcmd_pending.items()):
+            if target_name == conn.client_name:
                 self.runcmd_pending.pop(tid, None)
                 if not fut.done():
                     fut.cancel()
@@ -593,20 +563,9 @@ class BotServer:
             with open(tmp, "w", encoding="utf-8") as f:
                 yaml.safe_dump(self.cfg, f, allow_unicode=True, sort_keys=False)
             os.replace(tmp, self.config_path)
-        await self._broadcast_permissions()
-
-    def _oper_cache_snapshot(self) -> dict:
-        ttl = self.oper_cache_ttl()
-        now = time.monotonic()
-        return {uh: is_oper for uh, (is_oper, ts) in self.oper_cache.items() if now - ts <= ttl}
 
     def _permission_update_msg(self) -> dict:
-        return make_permission_update(self.permissions.snapshot(), self._oper_cache_snapshot())
+        return {"type": "permission_update"}  # 兼容占位（协议已无此消息，仅保留空壳）
 
     async def _broadcast_permissions(self) -> None:
-        msg = self._permission_update_msg()
-        for conn in list(self.conns.values()):
-            try:
-                await conn.send(msg)
-            except (ConnectionError, OSError):
-                pass
+        pass  # 协议精简后无 permission_update 消息；权限数据 server 本地持有
