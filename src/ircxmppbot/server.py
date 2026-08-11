@@ -280,16 +280,20 @@ class BotServer:
         voters = self._collect_voters()
         voters.add(caller)  # 发起者必投
         deadline_ts = time.time() + self.confirm_timeout()
+        # 问题2: 只统计可上报可达名单的 client（非 XMPP）——IRC 参与投票，XMPP 不参与
+        expected_clients = sum(1 for c in self.conns.values() if c.client_type == "irc")
         prop = {
             "proposal_id": proposal_id,
             "candidate": target,
             "deadline": time.monotonic() + self.confirm_timeout(),
-            "voters": voters,          # 初始全集；收集可达后定稿
-            "votes": {caller: True},   # 发起者自动同意
-            "reachable": set(),        # M8: 各 client 上报的可达投票人
+            "initial_voters": set(voters),   # 定稿前全集（用于校验上报来源）
+            "voters": voters,                # 初始全集；收集可达后定稿
+            "votes": {caller: True},         # 发起者自动同意
+            "reachable": set(),              # M8: 各 client 上报的可达投票人
             "reach_reports": 0,
-            "expected_clients": len(self.conns),
-            "collecting": True,        # 收集窗口进行中
+            "reported_by": set(),            # 问题3: 已上报的 conn，防重复
+            "expected_clients": expected_clients,
+            "collecting": True,              # 收集窗口进行中
             "origin_conn": conn,
             "origin_caller": caller,
             "origin_channel": channel,
@@ -347,7 +351,14 @@ class BotServer:
         prop = self.proposals.get(pid)
         if prop is None or not prop.get("collecting", False):
             return
-        prop["reachable"].update(parse_userhost(u) for u in (msg.get("reachable", []) or []))
+        # 问题3: 同一 conn 只计一次
+        if conn.client_name in prop["reported_by"]:
+            return
+        # 只接受初始投票人集合内的 userhost（防伪造/扩大投票人）
+        valid = [u for u in (msg.get("reachable", []) or [])
+                 if parse_userhost(u) in prop["initial_voters"]]
+        prop["reported_by"].add(conn.client_name)
+        prop["reachable"].update(parse_userhost(u) for u in valid)
         prop["reach_reports"] += 1
 
     async def _proposal_timer(self, proposal_id: str) -> None:
@@ -366,6 +377,10 @@ class BotServer:
         prop = self.proposals.get(pid)
         if prop is None:
             await self._reply(conn, False, f"提议 {pid} 不存在或已结束", None, voter)
+            return
+        if prop.get("collecting", False):
+            # 收集窗口内 voters 尚未定稿，拒绝投票（防不可达用户提前否决）
+            await self._reply(conn, False, "投票收集中，请稍候", None, voter)
             return
         if voter not in prop["voters"]:
             await self._reply(conn, False, "你不是该提议的投票人", None, voter)

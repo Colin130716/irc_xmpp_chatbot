@@ -109,13 +109,3 @@ def test_whitelist_channel_case_insensitive():
     )
     assert p.whitelist_allows("good!u@h", "#chan1")
     assert not p.whitelist_allows("good!u@h", "#chan2")
-
-
-def test_whitelist_channel_case_insensitive():
-    p = Permissions.from_config(
-        _cfg(whitelist={"enabled": True, "entries": [
-            {"mask": "good!*@*", "channel": "#Chan1"},
-        ]})
-    )
-    assert p.whitelist_allows("good!u@h", "#chan1")
-    assert not p.whitelist_allows("good!u@h", "#chan2")

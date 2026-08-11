@@ -7,6 +7,7 @@ import pytest
 from ircxmppbot.config import load_yaml
 from ircxmppbot.protocol import (
     make_command,
+    make_reachability,
     make_runcmd_result,
     make_vote,
 )
@@ -367,3 +368,79 @@ async def _report_reachable(srv, conn, pid, reachable):
         await asyncio.sleep(0.02)
     return srv.proposals.get(pid)
 
+
+
+# ---------- 复审回归：M8 收窄/竞态/来源校验 ----------
+
+async def test_shellop_reachability_narrows_voters(srv):
+    """M8 收窄：初始 3 投票人，只有 2 人可达 → 定稿后 voters=2 人。"""
+    conn = FakeConn("irc_main")
+    srv.conns = {"irc_main": conn}
+    # 3 个 botop（op1/op2/op3），op3 不可达
+    srv.permissions.botop = {"op1@host.example", "op2@host.example", "op3@host.example"}
+    srv.oper_cache["op2@host.example"] = (True, time.monotonic())
+
+    await _cmd(srv, conn, "shellop", ["add", "op2@host.example"], "op1@host.example", is_oper=True)
+    pid = next(m for m in conn.sent if m["type"] == "shellop_proposal")["proposal_id"]
+
+    # 只有 op1/op2 可达（op3 不可达不上报）
+    await _report_reachable(srv, conn, pid, ["op1@host.example", "op2@host.example"])
+    prop = srv.proposals[pid]
+    assert prop["voters"] == {"op1@host.example", "op2@host.example"}  # op3 被排除
+
+
+async def test_shellop_vote_rejected_during_collecting(srv):
+    """M8 竞态：收集窗口内投票被拒（防止不可达用户提前否决）。"""
+    conn = FakeConn("irc_main")
+    srv.conns = {"irc_main": conn}
+    srv.permissions.botop = {"op1@host.example", "op2@host.example", "op3@host.example"}
+    srv.oper_cache["op2@host.example"] = (True, time.monotonic())
+
+    await _cmd(srv, conn, "shellop", ["add", "op2@host.example"], "op1@host.example", is_oper=True)
+    pid = next(m for m in conn.sent if m["type"] == "shellop_proposal")["proposal_id"]
+
+    # 收集窗口内尝试投票 → 拒绝
+    vote_conn = FakeConn("irc_other")
+    await srv._handle_vote(vote_conn, make_vote(pid, "reject", "op3@host.example"))
+    assert "op3@host.example" not in srv.permissions.shellop
+    last = vote_conn.sent[-1]
+    assert not last["ok"] and "收集" in last["reply"]
+    # 提议仍在（未被否决）
+    assert pid in srv.proposals
+
+
+async def test_shellop_reachability_rejects_non_initial_voter(srv):
+    """M8 来源校验：上报不在初始投票人集合内的 userhost 被忽略。"""
+    conn = FakeConn("irc_main")
+    srv.conns = {"irc_main": conn}
+    srv.permissions.botop = {"op1@host.example", "op2@host.example"}
+    srv.oper_cache["op2@host.example"] = (True, time.monotonic())
+
+    await _cmd(srv, conn, "shellop", ["add", "op2@host.example"], "op1@host.example", is_oper=True)
+    pid = next(m for m in conn.sent if m["type"] == "shellop_proposal")["proposal_id"]
+
+    # 恶意上报：stranger 不在 initial_voters → 被过滤，可达名单只剩发起者 op1
+    # （收集完成即"仅发起者一人可触达"直接通过，op2 成为 shellop）
+    await _report_reachable(srv, conn, pid, ["op1@host.example", "stranger@evil.example"])
+    assert pid not in srv.proposals  # 提议已定稿并结束
+    assert "stranger@evil.example" not in srv.permissions.shellop  # 恶意上报未生效
+
+
+async def test_shellop_reachability_dup_conn_single_count(srv):
+    """M8 去重：同一 conn 重复上报只计一次。"""
+    conn = FakeConn("irc_main")
+    srv.conns = {"irc_main": conn}
+    srv.permissions.botop = {"op1@host.example", "op2@host.example"}
+    srv.oper_cache["op2@host.example"] = (True, time.monotonic())
+
+    await _cmd(srv, conn, "shellop", ["add", "op2@host.example"], "op1@host.example", is_oper=True)
+    pid = next(m for m in conn.sent if m["type"] == "shellop_proposal")["proposal_id"]
+
+    prop = srv.proposals[pid]
+    expected = prop["expected_clients"]
+    # 同一 conn 上报两次
+    await srv._handle_reachability(conn, make_reachability(pid, ["op1@host.example"]))
+    await srv._handle_reachability(conn, make_reachability(pid, ["op2@host.example"]))
+    assert prop["reach_reports"] == 1  # 只计一次
+    assert prop["reachable"] == {"op1@host.example"}  # 第二次被忽略
+    assert prop["expected_clients"] == expected
