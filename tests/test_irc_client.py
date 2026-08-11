@@ -1,4 +1,5 @@
 import asyncio
+import time
 from pathlib import Path
 
 import pytest
@@ -349,3 +350,28 @@ async def test_exec_runcmd_no_session(bot, monkeypatch):
     monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
     await bot._exec_runcmd({"task_id": "t1", "cmd": "id", "caller_userhost": "nobody@host.example"})
     assert sent and sent[0]["as_root"] is False and sent[0]["root_expired"] is False
+
+
+async def test_dm_proposal_reports_reachable(bot, monkeypatch):
+    """M8: 私信可达投票人后上报 reachability 名单。"""
+    sent = []
+
+    async def fake_server_send(msg):
+        sent.append(msg)
+
+    async def fake_message(nick, text):
+        pass
+
+    monkeypatch.setattr(bot, "_server_send", fake_server_send)
+    monkeypatch.setattr(bot, "message", fake_message)
+
+    await bot._dm_proposal({
+        "proposal_id": "ab12",
+        "candidate": "op2@host.example",
+        "deadline_ts": time.time() + 60,
+        "voters": ["op1@host.example", "op2@host.example", "ghost@host.example"],
+    })
+    reach = [m for m in sent if m["type"] == "reachability"]
+    assert reach, "应上报可达名单"
+    assert set(reach[0]["reachable"]) == {"op1@host.example", "op2@host.example"}
+    assert "ghost@host.example" not in reach[0]["reachable"]

@@ -151,6 +151,11 @@ async def test_shellop_full_confirm_flow(srv):
     assert "op1@host.example" in proposal["voters"]
     assert "op2@host.example" in proposal["voters"]
 
+    # 模拟 client 上报可达投票人（op1 发起者 + op2），等待收集定稿
+    await _report_reachable(srv, conn, pid, ["op1@host.example", "op2@host.example"])
+    prop = srv.proposals[pid]
+    assert prop["voters"] == {"op1@host.example", "op2@host.example"}
+
     # 另一个投票人 op2 投 confirm → 全员同意（op1 自动同意 + op2）
     vote_conn = FakeConn("irc_other")
     await srv._handle_vote(vote_conn, make_vote(pid, "confirm", "op2@host.example"))
@@ -166,6 +171,8 @@ async def test_shellop_reject_flow(srv):
     srv.oper_cache["op2@host.example"] = (True, time.monotonic())
     await _cmd(srv, conn, "shellop", ["add", "op2@host.example"], "op1@host.example", is_oper=True)
     pid = next(m for m in conn.sent if m["type"] == "shellop_proposal")["proposal_id"]
+
+    await _report_reachable(srv, conn, pid, ["op1@host.example", "op2@host.example"])
 
     vote_conn = FakeConn("irc_other")
     await srv._handle_vote(vote_conn, make_vote(pid, "reject", "op2@host.example"))
@@ -347,3 +354,16 @@ async def test_dup_client_name_rejected(srv):
     # 旧连接（conn1）断开：_drop_pending_for 不影响新条目（此处 conns 无新条目）
     srv._drop_pending_for(conn1)
     assert srv.conns.get("irc_main") is conn1
+
+
+async def _report_reachable(srv, conn, pid, reachable):
+    """模拟 client 上报可达投票人，并等待收集窗口定稿。"""
+    from ircxmppbot.protocol import make_reachability
+    await srv._handle_reachability(conn, make_reachability(pid, reachable))
+    for _ in range(50):
+        prop = srv.proposals.get(pid)
+        if prop is None or not prop.get("collecting", True):
+            return prop
+        await asyncio.sleep(0.02)
+    return srv.proposals.get(pid)
+

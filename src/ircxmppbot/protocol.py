@@ -16,6 +16,7 @@ VALID_TYPES = frozenset(
         "runcmd",
         "runcmd_result",
         "getroot",
+        "reachability",
         "status",
     }
 )
@@ -110,6 +111,14 @@ def make_shellop_proposal(
         "candidate": candidate,
         "deadline_ts": deadline_ts,
         "voters": voters,
+    }
+
+
+def make_reachability(proposal_id: str, reachable: list[str]) -> dict:
+    return {
+        "type": "reachability",
+        "proposal_id": proposal_id,
+        "reachable": reachable,
     }
 
 

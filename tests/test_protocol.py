@@ -9,6 +9,7 @@ from ircxmppbot.protocol import (
     make_command_result,
     make_getroot,
     make_permission_update,
+    make_reachability,
     make_runcmd,
     make_runcmd_result,
     make_shellop_proposal,
@@ -114,4 +115,10 @@ def test_make_vote_and_runcmd_shape():
 def test_make_getroot_shape():
     assert make_getroot("t1", "secret", "u@h") == {
         "type": "getroot", "task_id": "t1", "password": "secret", "caller_userhost": "u@h",
+    }
+
+
+def test_make_reachability_shape():
+    assert make_reachability("ab12", ["op1@h", "op2@h"]) == {
+        "type": "reachability", "proposal_id": "ab12", "reachable": ["op1@h", "op2@h"],
     }

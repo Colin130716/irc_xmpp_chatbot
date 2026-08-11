@@ -20,6 +20,7 @@ from .protocol import (
     encode_msg,
     make_auth,
     make_command,
+    make_reachability,
     make_runcmd_result,
     make_vote,
 )
@@ -218,10 +219,15 @@ class IRCBot(pydle.Client):
             f"回复 !{self.bot_name} confirm {msg['proposal_id']} 同意 / "
             f"!{self.bot_name} reject {msg['proposal_id']} 拒绝（{remaining} 秒内，全员同意才生效）"
         )
+        reachable = []
         for voter in msg.get("voters", []):
             nick = self._nick_for_userhost(voter)
             if nick and nick != self.nickname:
                 await self.message(nick, text)
+                reachable.append(voter)
+        # M8: 上报可达投票人，server 据此定稿 voters（防不可达投票人死锁）
+        if reachable:
+            await self._server_send(make_reachability(msg["proposal_id"], reachable))
 
     def _nick_for_userhost(self, userhost: str) -> str | None:
         want = parse_userhost(userhost)

@@ -30,6 +30,7 @@ log = logging.getLogger(__name__)
 
 AUTH_TIMEOUT = 10.0
 RUNCMD_TIMEOUT = 300.0
+REACHABILITY_TIMEOUT = 2.0  # shellop 收集可达投票人窗口（秒）
 
 
 class ClientConnection:
@@ -181,6 +182,8 @@ class BotServer:
             await self._handle_vote(conn, msg)
         elif t == "runcmd_result":
             await self._handle_runcmd_result(conn, msg)
+        elif t == "reachability":
+            await self._handle_reachability(conn, msg)
         elif t == "status":
             pass
         else:
@@ -281,8 +284,12 @@ class BotServer:
             "proposal_id": proposal_id,
             "candidate": target,
             "deadline": time.monotonic() + self.confirm_timeout(),
-            "voters": voters,
-            "votes": {caller: True},  # 发起者自动同意
+            "voters": voters,          # 初始全集；收集可达后定稿
+            "votes": {caller: True},   # 发起者自动同意
+            "reachable": set(),        # M8: 各 client 上报的可达投票人
+            "reach_reports": 0,
+            "expected_clients": len(self.conns),
+            "collecting": True,        # 收集窗口进行中
             "origin_conn": conn,
             "origin_caller": caller,
             "origin_channel": channel,
@@ -290,8 +297,9 @@ class BotServer:
         }
         self.proposals[proposal_id] = prop
         prop["task"] = asyncio.create_task(self._proposal_timer(proposal_id))
+        prop["collect_task"] = asyncio.create_task(self._collect_reachability(proposal_id))
         await self._broadcast_proposal(proposal_id, target, deadline_ts, sorted(voters))
-        await self._reply(conn, True, f"shellop 提议 #{proposal_id} 已发送给 {len(voters)} 位在线 botop+oper 确认", channel, caller)
+        await self._reply(conn, True, f"shellop 提议 #{proposal_id} 已创建，正在确认可触达投票人", channel, caller)
 
     def _collect_voters(self) -> set[str]:
         voters = set(self.permissions.botop)
@@ -309,6 +317,38 @@ class BotServer:
                 await conn.send(msg)
             except (ConnectionError, OSError):
                 pass
+
+    async def _collect_reachability(self, pid: str) -> None:
+        """收集各 client 上报的可达投票人，定稿 voters（M8 防死锁）。"""
+        prop = self.proposals.get(pid)
+        if prop is None:
+            return
+        deadline = time.monotonic() + REACHABILITY_TIMEOUT
+        while time.monotonic() < deadline and prop["reach_reports"] < prop["expected_clients"]:
+            await asyncio.sleep(0.1)
+        if pid not in self.proposals:
+            return
+        # 定稿 voters = 可达集合 ∪ 发起者
+        prop["voters"] = prop["reachable"] | {prop["origin_caller"]}
+        prop["collecting"] = False
+        # 若仅发起者一人（其他投票人全部不可达）→ 直接通过
+        if len(prop["voters"]) <= 1:
+            await self._finalize_proposal(pid, success=True, reason="仅发起者一人可触达，全员同意")
+            return
+        try:
+            await self._reply(prop["origin_conn"], True,
+                              f"提议 #{pid} 已通知 {len(prop['voters'])} 位可触达投票人确认",
+                              prop["origin_channel"], prop["origin_caller"])
+        except (ConnectionError, OSError):
+            pass
+
+    async def _handle_reachability(self, conn: ClientConnection, msg: dict) -> None:
+        pid = msg.get("proposal_id", "")
+        prop = self.proposals.get(pid)
+        if prop is None or not prop.get("collecting", False):
+            return
+        prop["reachable"].update(parse_userhost(u) for u in (msg.get("reachable", []) or []))
+        prop["reach_reports"] += 1
 
     async def _proposal_timer(self, proposal_id: str) -> None:
         prop = self.proposals.get(proposal_id)
@@ -358,6 +398,12 @@ class BotServer:
             prop["task"].cancel()
             try:
                 await prop["task"]
+            except asyncio.CancelledError:
+                pass
+        if prop.get("collect_task"):
+            prop["collect_task"].cancel()
+            try:
+                await prop["collect_task"]
             except asyncio.CancelledError:
                 pass
         if success:
