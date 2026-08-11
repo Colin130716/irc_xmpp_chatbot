@@ -13,7 +13,7 @@ from pathlib import Path
 import yaml
 
 from .commands import COMMAND_LEVELS
-from .config import ConfigError, ConfigWatcher, load_yaml
+from .config import ConfigError, ConfigWatcher
 from .irc_session import IRCSession
 from .llm import LLMClient
 from .permissions import Permissions
