@@ -14,6 +14,27 @@ def split_text(text: str, limit: int) -> list[str]:
     return [text[i : i + limit] for i in range(0, len(text), limit)]
 
 
+def split_text_bytes(text: str, limit: int) -> list[str]:
+    """按 UTF-8 字节数分片，不切断多字节字符（如中文 3 字节/字）。"""
+    if not text or limit <= 0:
+        return []
+    chunks: list[str] = []
+    current = ""
+    current_bytes = 0
+    for ch in text:
+        ch_bytes = len(ch.encode("utf-8"))
+        if current and current_bytes + ch_bytes > limit:
+            chunks.append(current)
+            current = ch
+            current_bytes = ch_bytes
+        else:
+            current += ch
+            current_bytes += ch_bytes
+    if current:
+        chunks.append(current)
+    return chunks
+
+
 def parse_userhost(hostmask: str) -> str:
     """从 nick!user@host 或 user@host 提取规范化的 user@host（小写）。"""
     hostmask = hostmask.strip()

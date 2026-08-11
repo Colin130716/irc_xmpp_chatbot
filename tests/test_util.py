@@ -1,4 +1,4 @@
-from ircxmppbot.util import backoff_delay, match_mask, parse_userhost, split_text
+from ircxmppbot.util import backoff_delay, match_mask, parse_userhost, split_text, split_text_bytes
 
 
 def test_split_text_short_unchanged():
@@ -44,3 +44,25 @@ def test_backoff_delay_sequence():
 
 def test_backoff_delay_cap():
     assert backoff_delay(10, cap=60.0) == 60.0
+
+
+def test_split_text_bytes_ascii():
+    assert split_text_bytes("abcdef", 2) == ["ab", "cd", "ef"]
+
+
+def test_split_text_bytes_utf8_not_split():
+    # 中文 3 字节/字：limit=12 正好 4 个字
+    assert split_text_bytes("中文测试", 12) == ["中文测试"]
+    # limit=9 放不下第 4 个字（3*4=12>9），回退到 3 个字
+    assert split_text_bytes("中文测试", 9) == ["中文测", "试"]
+    assert all(len(c.encode("utf-8")) <= 9 for c in split_text_bytes("中文测试", 9))
+
+
+def test_split_text_bytes_mixed():
+    chunks = split_text_bytes("ab中文cd", 5)
+    assert all(len(c.encode("utf-8")) <= 5 for c in chunks)
+    assert "".join(chunks) == "ab中文cd"
+
+
+def test_split_text_bytes_empty():
+    assert split_text_bytes("", 10) == []
