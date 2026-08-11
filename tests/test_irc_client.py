@@ -1,3 +1,4 @@
+import asyncio
 from pathlib import Path
 
 import pytest
@@ -209,3 +210,133 @@ async def test_no_lists_no_kick(bot, monkeypatch):
     monkeypatch.setattr(bot, "kick", fake_kick)
     await bot._enforce_lists("#chan1", "op2")
     assert kicked == []
+
+
+# ---------- getroot 提权 ----------
+
+async def test_exec_getroot_success(bot, monkeypatch):
+    """密码正确 → 缓存会话 + 回传 as_root=True。"""
+    sent = []
+
+    async def fake_server_send(msg):
+        sent.append(msg)
+
+    monkeypatch.setattr(bot, "_server_send", fake_server_send)
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            return (b"0\n", b"")
+
+    async def fake_create_subprocess_shell(cmd, **kwargs):
+        assert "su --pty root -c 'id -u'" in cmd
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
+    await bot._exec_getroot({"task_id": "t1", "password": "pw", "caller_userhost": "boss@host.example"})
+    assert sent and sent[0]["as_root"] is True
+    assert "boss@host.example" in bot.root_sessions
+
+
+async def test_exec_getroot_wrong_password(bot, monkeypatch):
+    """密码错误 → 不缓存 + 回传错误。"""
+    sent = []
+
+    async def fake_server_send(msg):
+        sent.append(msg)
+
+    monkeypatch.setattr(bot, "_server_send", fake_server_send)
+
+    class FakeProc:
+        returncode = 1
+
+        async def communicate(self):
+            return (b"su: Authentication failure\n", b"")
+
+    async def fake_create_subprocess_shell(cmd, **kwargs):
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
+    await bot._exec_getroot({"task_id": "t1", "password": "bad", "caller_userhost": "boss@host.example"})
+    assert sent and sent[0]["ok"] is False
+    assert "boss@host.example" not in bot.root_sessions
+
+
+async def test_exec_runcmd_as_root(bot, monkeypatch):
+    """有效会话 → 命令被 su 包装执行，回传 as_root=True。"""
+    import time as _time
+    bot.root_sessions["boss@host.example"] = ("pw", _time.monotonic() + 300)
+    sent = []
+    commands = []
+
+    async def fake_server_send(msg):
+        sent.append(msg)
+
+    monkeypatch.setattr(bot, "_server_send", fake_server_send)
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            return (b"uid=0(root)\n", b"")
+
+    async def fake_create_subprocess_shell(cmd, **kwargs):
+        commands.append(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
+    await bot._exec_runcmd({"task_id": "t1", "cmd": "id", "caller_userhost": "boss@host.example"})
+    assert commands and "su --pty root -c" in commands[0]
+    assert sent and sent[0]["as_root"] is True
+
+
+async def test_exec_runcmd_expired(bot, monkeypatch):
+    """过期会话 → 普通执行 + root_expired=True。"""
+    import time as _time
+    bot.root_sessions["boss@host.example"] = ("pw", _time.monotonic() - 1)
+    sent = []
+    commands = []
+
+    async def fake_server_send(msg):
+        sent.append(msg)
+
+    monkeypatch.setattr(bot, "_server_send", fake_server_send)
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            return (b"uid=1000\n", b"")
+
+    async def fake_create_subprocess_shell(cmd, **kwargs):
+        commands.append(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
+    await bot._exec_runcmd({"task_id": "t1", "cmd": "id", "caller_userhost": "boss@host.example"})
+    assert commands and "su --pty" not in commands[0]
+    assert sent and sent[0]["root_expired"] is True
+
+
+async def test_exec_runcmd_no_session(bot, monkeypatch):
+    """无会话 → 普通执行，无过期标记。"""
+    sent = []
+
+    async def fake_server_send(msg):
+        sent.append(msg)
+
+    monkeypatch.setattr(bot, "_server_send", fake_server_send)
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            return (b"uid=1000\n", b"")
+
+    async def fake_create_subprocess_shell(cmd, **kwargs):
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
+    await bot._exec_runcmd({"task_id": "t1", "cmd": "id", "caller_userhost": "nobody@host.example"})
+    assert sent and sent[0]["as_root"] is False and sent[0]["root_expired"] is False

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shlex
 import ssl
 import time
 from pathlib import Path
@@ -48,6 +49,8 @@ class IRCBot(pydle.Client):
         # userhost -> is_oper（本地镜像，来自 server 推送 + 本地 WHOIS）
         self.oper_cache: dict[str, bool] = {}
         self.llm = LLMClient(self.cfg.get("llm", {}))
+        # userhost -> (root 密码, 过期 monotonic 时间)；仅存内存
+        self.root_sessions: dict[str, tuple[str, float]] = {}
         self._server_reader: asyncio.StreamReader | None = None
         self._server_writer: asyncio.StreamWriter | None = None
         self._server_task: asyncio.Task | None = None
@@ -127,6 +130,8 @@ class IRCBot(pydle.Client):
             await self._dm_proposal(msg)
         elif t == "runcmd":
             await self._exec_runcmd(msg)
+        elif t == "getroot":
+            await self._exec_getroot(msg)
         elif t == "command_result":
             await self._handle_command_result(msg)
         else:
@@ -228,18 +233,57 @@ class IRCBot(pydle.Client):
 
     # ---------- runcmd 执行 ----------
 
+    def _root_session_ttl(self) -> float:
+        return float(self.cfg.get("root_session_ttl", 300))
+
+    async def _exec_getroot(self, msg: dict) -> None:
+        task_id = msg["task_id"]
+        password = msg["password"]
+        caller = parse_userhost(msg.get("caller_userhost", ""))
+        log.info("getroot 验证请求（user=%s）", caller)
+        proc = await asyncio.create_subprocess_shell(
+            f"printf '%s\n' {shlex.quote(password)} | su --pty root -c 'id -u'",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
+        stdout, _ = await proc.communicate()
+        ok = proc.returncode == 0 and stdout.strip() == b"0"
+        if ok and caller:
+            self.root_sessions[caller] = (password, time.monotonic() + self._root_session_ttl())
+            output = f"root 已激活（{int(self._root_session_ttl())} 秒有效）"
+            log.info("getroot 成功: %s", caller)
+        else:
+            output = "root 密码验证失败"
+            log.warning("getroot 失败: %s", caller)
+        await self._server_send(make_runcmd_result(task_id, ok, output, as_root=ok))
+
     async def _exec_runcmd(self, msg: dict) -> None:
         task_id = msg["task_id"]
         cmd = msg["cmd"]
-        log.info("执行 runcmd: %s", cmd)
+        caller = parse_userhost(msg.get("caller_userhost", ""))
+        entry = self.root_sessions.get(caller)
+        now = time.monotonic()
+        as_root = False
+        root_expired = False
+        if entry and entry[1] > now:
+            as_root = True
+            full_cmd = f"printf '%s\n' {shlex.quote(entry[0])} | su --pty root -c {shlex.quote(cmd)}"
+        elif entry:
+            root_expired = True
+            full_cmd = cmd
+        else:
+            full_cmd = cmd
+        log.info("执行 runcmd (root=%s): %s", as_root, cmd)
         proc = await asyncio.create_subprocess_shell(
-            cmd,
+            full_cmd,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.STDOUT,
         )
         stdout, _ = await proc.communicate()
         output = stdout.decode("utf-8", errors="replace")
-        await self._server_send(make_runcmd_result(task_id, proc.returncode == 0, output))
+        await self._server_send(make_runcmd_result(
+            task_id, proc.returncode == 0, output, as_root=as_root, root_expired=root_expired
+        ))
 
     # ---------- 命令结果（含 ban/unban 动作） ----------
 
