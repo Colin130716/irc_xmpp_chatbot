@@ -26,8 +26,9 @@ $PY -m ircxmppbot server configs/server.yaml   # 启动（需真实证书/服务
 ## 架构
 
 - **server.py（BotServer）**：权威权限中枢。持有 botop/shellop/黑白名单、oper 缓存（WHOIS 313 上报）、shellop 确认投票编排、runcmd 跨 client 路由。权限命令生效时**原子写回 server.yaml**（tmp + `os.replace`），热重载以文件为准。
-- **irc_client.py（IRCBot，pydle）**：完整命令集、oper WHOIS、黑白名单 JOIN 踢人、`_exec_getroot`/`_exec_runcmd`。
+- **irc_client.py（IRCBot，pydle）**：完整命令集、oper WHOIS、黑白名单 JOIN 踢人、shellop 提议私信+可达上报。
 - **xmpp_client.py（XMPPBot，slixmpp）**：仅 chat（私聊免前缀/群聊带前缀）+ runcmd 执行目标，**不参与权限机制**。
+- **server_link.py（ServerLink）**：两个 client 共享的 server 连接层——TLS 连接/重连、消息分发、getroot/root 会话（`exec_getroot`/`exec_runcmd`/`root_sessions`）。client 特有消息通过 handler 回调。
 - **protocol.py**：TLS TCP + JSON lines，每个消息含 `type` 字段；`make_*` 构造器是唯一消息来源。新增消息类型须同时更新 `VALID_TYPES`。
 - **permissions.py**：`LEVELS = everyone < botop < oper < shellop`；白名单与黑名单**禁止同时启用**（`validate_mutex` 抛 `ConfigError`）。
 
@@ -36,7 +37,8 @@ $PY -m ircxmppbot server configs/server.yaml   # 启动（需真实证书/服务
 `commands.py::COMMAND_LEVELS` 是命令→最低权限注册表（chat/help=everyone，ban/unban/whitelist/blacklist/info/confirm/reject=botop，botop/shellop=oper，runcmd=shellop）。
 
 - **confirm/reject 走 `vote` 消息**（server 无 `_cmd_confirm/_cmd_reject` 处理器）——irc_client `_maybe_command` 特判路由到 `_server_vote`。
-- **getroot**：`runcmd getroot <pw>` 是 server 特判子命令（目标=调用者所在 client），密码存 client 内存 `root_sessions`，5 分钟 TTL（`root_session_ttl` 配置），过期回退普通用户并提示。密码**不可**进日志或 `cmd` 字段。
+- **getroot**：`runcmd getroot <pw>` 是 server 特判子命令（目标=调用者所在 client），密码存 client 内存 `root_sessions`（5 分钟 TTL，`root_session_ttl` 配置），过期回退普通用户并提示。密码**不可**进日志或 `cmd` 字段；经 `su --pty` 的 stdin 传递（不进 argv，`ps` 不可见）。
+- **shellop 确认（M8）**：投票人须可触达——client 私信可达投票人后回传 `reachability` 消息，server 收集窗口（2s）后定稿 voters，仅发起者可触达则直接通过。
 - 权限判定在 server 端：client 上报 `command`（含 caller_userhost + caller_is_oper），server 查权限表后返回 `command_result`。
 
 ## 库版本特性（易踩坑）
@@ -49,7 +51,8 @@ $PY -m ircxmppbot server configs/server.yaml   # 启动（需真实证书/服务
 
 - `pytest-asyncio` 为 auto 模式（async 测试无需装饰器）；测试不依赖真实 IRC/XMPP/root（mock transport / mock `asyncio.create_subprocess_shell`）。
 - mock 被 `await` 的方法（如 `_server_send`、`message`、`kick`、`_whois_user`）必须是 **async 函数**；slixmpp 的 `send_message` 是同步调用，mock 须为同步。
-- 服务器测试用 `FakeConn`（记录 `sent` 消息）；需验证广播（shellop 提议/权限快照）到达时必须先把 conn 注册进 `srv.conns`。
+- 服务器测试用 `FakeConn`（记录 `sent` 消息）；需验证广播（shellop 提议/权限快照）到达时必须先把 conn 注册进 `srv.conns`。shellop 投票测试须先模拟 `reachability` 上报（`_report_reachable` 辅助）再投票。
+- client 的 getroot/root 会话逻辑在 `ServerLink` 上（`bot.link.exec_getroot` 等）；测试 mock `asyncio.create_subprocess_exec`（密码走 stdin）与 `create_subprocess_shell`（普通命令）。
 - shellop 流程测试会创建 proposal timer 任务，`_finalize_proposal` 已 await 取消，测试结束无悬挂任务。
 
 ## 文档与流程
