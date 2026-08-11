@@ -19,6 +19,7 @@ from .protocol import (
     decode_msg,
     encode_msg,
     make_command_result,
+    make_getroot,
     make_permission_update,
     make_runcmd,
     make_shellop_proposal,
@@ -416,8 +417,32 @@ class BotServer:
         await self._reply(conn, True, f"已批准解封 {args[0]}", channel, caller, action="unban", action_args=[args[0]])
 
     async def _cmd_runcmd(self, conn, args, caller, is_oper, channel) -> None:
-        if len(args) < 2:
+        if not args:
             await self._reply(conn, False, "用法: runcmd <client_name> <cmd...>", channel, caller)
+            return
+        if args[0] == "getroot":
+            # getroot 子命令：目标 = 调用者所在 client（发起 conn 自身）
+            if len(args) < 2 or not args[1]:
+                await self._reply(conn, False, "用法: runcmd getroot <client_root_password>", channel, caller)
+                return
+            password = args[1]
+            task_id = uuid.uuid4().hex
+            fut: asyncio.Future = asyncio.get_running_loop().create_future()
+            self.runcmd_pending[task_id] = (fut, conn, caller)
+            try:
+                await conn.send(make_getroot(task_id, password, caller))
+            except (ConnectionError, OSError):
+                self.runcmd_pending.pop(task_id, None)
+                await self._reply(conn, False, "client 连接异常", channel, caller)
+                return
+            await self._reply(conn, True, "getroot 已发送到本 client，等待验证", channel, caller)
+            try:
+                ok, output = await asyncio.wait_for(fut, timeout=RUNDMD_TIMEOUT)
+            except asyncio.TimeoutError:
+                await self._reply(conn, False, "getroot 验证超时", None, caller)
+                return
+            text = output if output else ("root 已激活" if ok else "root 验证失败")
+            await conn.send(make_command_result(ok, text, "private", caller))
             return
         target_name = args[0]
         cmd = " ".join(args[1:])
@@ -429,7 +454,7 @@ class BotServer:
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
         self.runcmd_pending[task_id] = (fut, conn, caller)
         try:
-            await target.send(make_runcmd(task_id, cmd))
+            await target.send(make_runcmd(task_id, cmd, caller_userhost=caller))
         except (ConnectionError, OSError):
             self.runcmd_pending.pop(task_id, None)
             await self._reply(conn, False, f"client {target_name} 连接异常", channel, caller)
@@ -454,7 +479,10 @@ class BotServer:
             return
         fut, origin_conn, caller = entry
         if not fut.done():
-            fut.set_result((bool(msg.get("ok")), msg.get("output", "")))
+            output = msg.get("output", "")
+            if msg.get("root_expired"):
+                output = "[root 会话已过期，已按普通用户执行，请重新 getroot]\n" + output
+            fut.set_result((bool(msg.get("ok")), output))
 
     # ---------- 持久化与广播 ----------
 

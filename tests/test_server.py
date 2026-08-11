@@ -216,3 +216,70 @@ async def test_runcmd_target_offline(srv):
     await _cmd(srv, conn, "runcmd", ["ghost", "ls"], "boss@host.example")
     assert not _last(conn)["ok"]
     assert "不在线" in _last(conn)["reply"]
+
+
+# ---------- getroot 提权 ----------
+
+async def test_runcmd_getroot_routes_to_self(srv):
+    """runcmd getroot 目标 = 调用者所在 client（发起 conn 自身）。"""
+    conn = FakeConn("irc_main")
+    srv.conns = {"irc_main": conn}
+    srv.permissions.shellop.add("boss@host.example")
+
+    task = asyncio.create_task(
+        srv._handle_command(
+            conn,
+            make_command("runcmd", ["getroot", "secretpw"], "boss@host.example", False, "#chan"),
+        )
+    )
+    for _ in range(100):
+        if any(m["type"] == "getroot" for m in conn.sent):
+            break
+        await asyncio.sleep(0.01)
+    getroot = next(m for m in conn.sent if m["type"] == "getroot")
+    assert getroot["password"] == "secretpw"
+    assert getroot["caller_userhost"] == "boss@host.example"
+
+    await srv._handle_runcmd_result(
+        make_runcmd_result(getroot["task_id"], True, "root 已激活（300 秒有效）", as_root=True)
+    )
+    await task
+    result = next(m for m in conn.sent if m["type"] == "command_result" and "root 已激活" in m["reply"])
+    assert result["target_type"] == "private"
+
+
+async def test_runcmd_getroot_missing_password(srv):
+    conn = FakeConn()
+    srv.permissions.shellop.add("boss@host.example")
+    await _cmd(srv, conn, "runcmd", ["getroot"], "boss@host.example")
+    assert not _last(conn)["ok"]
+    assert "用法" in _last(conn)["reply"]
+
+
+async def test_runcmd_expired_hint(srv):
+    """root 会话过期 → 私信结果附加提示。"""
+    origin = FakeConn("irc_main")
+    target = FakeConn("xmpp_main")
+    srv.conns = {"irc_main": origin, "xmpp_main": target}
+    srv.permissions.shellop.add("boss@host.example")
+
+    task = asyncio.create_task(
+        srv._handle_command(
+            origin,
+            make_command("runcmd", ["xmpp_main", "id"], "boss@host.example", False, "#chan"),
+        )
+    )
+    for _ in range(100):
+        if any(m["type"] == "runcmd" for m in target.sent):
+            break
+        await asyncio.sleep(0.01)
+    runcmd = next(m for m in target.sent if m["type"] == "runcmd")
+    assert runcmd["caller_userhost"] == "boss@host.example"
+
+    await srv._handle_runcmd_result(
+        make_runcmd_result(runcmd["task_id"], True, "uid=1000", root_expired=True)
+    )
+    await task
+    result = next(m for m in origin.sent if m["type"] == "command_result" and m["target_type"] == "private")
+    assert "root 会话已过期" in result["reply"]
+    assert "uid=1000" in result["reply"]
