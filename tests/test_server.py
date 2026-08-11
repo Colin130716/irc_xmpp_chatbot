@@ -204,7 +204,7 @@ async def test_runcmd_routes_to_target(srv):
     runcmd = next(m for m in target.sent if m["type"] == "runcmd")
     assert runcmd["cmd"] == "ls -la"
 
-    await srv._handle_runcmd_result(make_runcmd_result(runcmd["task_id"], True, "total 8"))
+    await srv._handle_runcmd_result(target, make_runcmd_result(runcmd["task_id"], True, "total 8"))
     await task
     result = next(m for m in origin.sent if m["type"] == "command_result" and m["target_type"] == "private")
     assert result["reply"] == "total 8"
@@ -241,7 +241,7 @@ async def test_runcmd_getroot_routes_to_self(srv):
     assert getroot["caller_userhost"] == "boss@host.example"
 
     await srv._handle_runcmd_result(
-        make_runcmd_result(getroot["task_id"], True, "root 已激活（300 秒有效）", as_root=True)
+        conn, make_runcmd_result(getroot["task_id"], True, "root 已激活（300 秒有效）", as_root=True)
     )
     await task
     result = next(m for m in conn.sent if m["type"] == "command_result" and "root 已激活" in m["reply"])
@@ -277,9 +277,73 @@ async def test_runcmd_expired_hint(srv):
     assert runcmd["caller_userhost"] == "boss@host.example"
 
     await srv._handle_runcmd_result(
-        make_runcmd_result(runcmd["task_id"], True, "uid=1000", root_expired=True)
+        target, make_runcmd_result(runcmd["task_id"], True, "uid=1000", root_expired=True)
     )
     await task
     result = next(m for m in origin.sent if m["type"] == "command_result" and m["target_type"] == "private")
     assert "root 会话已过期" in result["reply"]
     assert "uid=1000" in result["reply"]
+
+
+# ---------- 审查回归测试 ----------
+
+async def test_runcmd_result_rejects_wrong_sender(srv):
+    """M4: runcmd_result 来自非目标 client 被拒绝。"""
+    origin = FakeConn("irc_main")
+    target = FakeConn("xmpp_main")
+    intruder = FakeConn("evil_client")
+    srv.conns = {"irc_main": origin, "xmpp_main": target, "evil_client": intruder}
+    srv.permissions.shellop.add("boss@host.example")
+
+    task = asyncio.create_task(
+        srv._handle_command(
+            origin,
+            make_command("runcmd", ["xmpp_main", "id"], "boss@host.example", False, "#chan"),
+        )
+    )
+    for _ in range(100):
+        if any(m["type"] == "runcmd" for m in target.sent):
+            break
+        await asyncio.sleep(0.01)
+    runcmd = next(m for m in target.sent if m["type"] == "runcmd")
+
+    # 冒名 intruder 尝试 resolve——应被拒绝
+    await srv._handle_runcmd_result(intruder, make_runcmd_result(runcmd["task_id"], True, "fake"))
+    # 真正的 target 才能 resolve
+    await srv._handle_runcmd_result(target, make_runcmd_result(runcmd["task_id"], True, "real"))
+    await task
+    result = next(m for m in origin.sent if m["type"] == "command_result" and m["target_type"] == "private")
+    assert result["reply"] == "real"
+
+
+async def test_dup_client_name_rejected(srv):
+    """H2: 重名 client 注册被拒，且旧连接断开不误删新连接。"""
+    from ircxmppbot.server import ClientConnection
+
+    class FakeReaderWriter:
+        def __init__(self):
+            self.sent = b""
+
+        async def write(self, data: bytes) -> None:
+            self.sent += data
+
+        async def drain(self) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+        async def wait_closed(self) -> None:
+            pass
+
+    # 注册第一个
+    conn1 = ClientConnection(None, FakeReaderWriter(), "irc_main", "irc", "bot")
+    assert srv._try_register(conn1) is True
+    # 重名第二个被拒
+    conn2 = ClientConnection(None, FakeReaderWriter(), "irc_main", "irc", "bot")
+    assert srv._try_register(conn2) is False
+    # 字典仍是 conn1
+    assert srv.conns["irc_main"] is conn1
+    # 旧连接（conn1）断开：_drop_pending_for 不影响新条目（此处 conns 无新条目）
+    srv._drop_pending_for(conn1)
+    assert srv.conns.get("irc_main") is conn1

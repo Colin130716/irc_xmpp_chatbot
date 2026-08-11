@@ -29,7 +29,7 @@ from .util import parse_userhost
 log = logging.getLogger(__name__)
 
 AUTH_TIMEOUT = 10.0
-RUNDMD_TIMEOUT = 300.0
+RUNCMD_TIMEOUT = 300.0
 
 
 class ClientConnection:
@@ -58,8 +58,8 @@ class BotServer:
         # userhost -> (is_oper, monotonic_ts)
         self.oper_cache: dict[str, tuple[bool, float]] = {}
         self.proposals: dict[str, dict] = {}
-        # task_id -> (future, origin_conn, caller)
-        self.runcmd_pending: dict[str, tuple[asyncio.Future, ClientConnection, str]] = {}
+        # task_id -> (future, origin_conn, caller, target_client_name)
+        self.runcmd_pending: dict[str, tuple[asyncio.Future, ClientConnection, str, str]] = {}
         self._persist_lock = asyncio.Lock()
 
     # ---------- 配置 ----------
@@ -87,7 +87,15 @@ class BotServer:
         ssl_ctx = None
         if tls_cfg and tls_cfg.get("certfile"):
             ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            ssl_ctx.load_cert_chain(tls_cfg["certfile"], tls_cfg.get("keyfile"))
+            cfg_dir = self.config_path.parent
+            certfile = tls_cfg["certfile"]
+            keyfile = tls_cfg.get("keyfile")
+            # 相对路径基于配置文件所在目录解析（避免 CWD 依赖）
+            if not Path(certfile).is_absolute():
+                certfile = str(cfg_dir / certfile)
+            if keyfile and not Path(keyfile).is_absolute():
+                keyfile = str(cfg_dir / keyfile)
+            ssl_ctx.load_cert_chain(certfile, keyfile)
         server = await asyncio.start_server(self._handle_client, host, port, ssl=ssl_ctx)
         log.info("server 监听 %s:%s (TLS=%s)", host, port, ssl_ctx is not None)
         watcher = ConfigWatcher(self.config_path, self._on_config_change)
@@ -103,6 +111,15 @@ class BotServer:
             log.error("热重载失败: %s", e)
 
     # ---------- 连接处理 ----------
+
+    def _try_register(self, conn: ClientConnection) -> bool:
+        """注册连接；重名返回 False（拒绝），防止旧 conn 断开时误删新连接。"""
+        if conn.client_name in self.conns:
+            log.warning("client 重名注册被拒: %s", conn.client_name)
+            return False
+        self.conns[conn.client_name] = conn
+        log.info("client 注册: %s (%s)", conn.client_name, conn.client_type)
+        return True
 
     async def _handle_client(self, reader, writer) -> None:
         conn: ClientConnection | None = None
@@ -124,8 +141,10 @@ class BotServer:
                 reader, writer,
                 msg["client_name"], msg.get("client_type", ""), msg.get("bot_name", ""),
             )
-            self.conns[conn.client_name] = conn
-            log.info("client 注册: %s (%s)", conn.client_name, conn.client_type)
+            if not self._try_register(conn):
+                writer.write(encode_msg({"type": "auth_ok", "ok": False}))
+                await writer.drain()
+                return
             await conn.send({"type": "auth_ok", "ok": True})
             await conn.send(self._permission_update_msg())
 
@@ -141,7 +160,10 @@ class BotServer:
             pass
         finally:
             if conn is not None:
-                self.conns.pop(conn.client_name, None)
+                # H2: 仅当字典中的条目仍是本连接时才删除（防止覆盖后误删新连接）
+                if self.conns.get(conn.client_name) is conn:
+                    self.conns.pop(conn.client_name, None)
+                self._drop_pending_for(conn)
                 log.info("client 断开: %s", conn.client_name)
             writer.close()
             try:
@@ -158,7 +180,7 @@ class BotServer:
         elif t == "vote":
             await self._handle_vote(conn, msg)
         elif t == "runcmd_result":
-            await self._handle_runcmd_result(msg)
+            await self._handle_runcmd_result(conn, msg)
         elif t == "status":
             pass
         else:
@@ -243,7 +265,9 @@ class BotServer:
             await self._reply(conn, False, f"候选人 {target} 不是 botop，无法提议为 shellop", channel, caller)
             return
         oper_info = self.oper_cache.get(target)
-        if not oper_info or not oper_info[0]:
+        oper_ttl = self.oper_cache_ttl()
+        oper_valid = oper_info and oper_info[0] and (time.monotonic() - oper_info[1]) <= oper_ttl
+        if not oper_valid:
             await self._reply(conn, False, f"候选人 {target} 未验证为 oper（需其 /oper 后触发机器人 WHOIS），无法提议", channel, caller)
             return
         if target in self.permissions.shellop:
@@ -428,7 +452,7 @@ class BotServer:
             password = args[1]
             task_id = uuid.uuid4().hex
             fut: asyncio.Future = asyncio.get_running_loop().create_future()
-            self.runcmd_pending[task_id] = (fut, conn, caller)
+            self.runcmd_pending[task_id] = (fut, conn, caller, conn.client_name)
             try:
                 await conn.send(make_getroot(task_id, password, caller))
             except (ConnectionError, OSError):
@@ -437,8 +461,9 @@ class BotServer:
                 return
             await self._reply(conn, True, "getroot 已发送到本 client，等待验证", channel, caller)
             try:
-                ok, output = await asyncio.wait_for(fut, timeout=RUNDMD_TIMEOUT)
+                ok, output = await asyncio.wait_for(fut, timeout=RUNCMD_TIMEOUT)
             except asyncio.TimeoutError:
+                self.runcmd_pending.pop(task_id, None)
                 await self._reply(conn, False, "getroot 验证超时", None, caller)
                 return
             text = output if output else ("root 已激活" if ok else "root 验证失败")
@@ -452,7 +477,7 @@ class BotServer:
             return
         task_id = uuid.uuid4().hex
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
-        self.runcmd_pending[task_id] = (fut, conn, caller)
+        self.runcmd_pending[task_id] = (fut, conn, caller, target_name)
         try:
             await target.send(make_runcmd(task_id, cmd, caller_userhost=caller))
         except (ConnectionError, OSError):
@@ -461,9 +486,10 @@ class BotServer:
             return
         await self._reply(conn, True, f"runcmd 已发送到 {target_name}", channel, caller)
         try:
-            ok, output = await asyncio.wait_for(fut, timeout=RUNDMD_TIMEOUT)
+            ok, output = await asyncio.wait_for(fut, timeout=RUNCMD_TIMEOUT)
         except asyncio.TimeoutError:
-            await self._reply(conn, False, f"runcmd 在 {target_name} 超时（{int(RUNDMD_TIMEOUT)}s）", None, caller)
+            self.runcmd_pending.pop(task_id, None)
+            await self._reply(conn, False, f"runcmd 在 {target_name} 超时（{int(RUNCMD_TIMEOUT)}s）", None, caller)
             return
         if not ok:
             text = f"命令执行失败:\n{output}" if output else "命令执行失败"
@@ -471,18 +497,31 @@ class BotServer:
             text = output if output else "命令执行成功，无输出"
         await conn.send(make_command_result(ok, text, "private", caller))
 
-    async def _handle_runcmd_result(self, msg: dict) -> None:
+    async def _handle_runcmd_result(self, conn: ClientConnection, msg: dict) -> None:
         tid = msg.get("task_id", "")
-        entry = self.runcmd_pending.pop(tid, None)
+        entry = self.runcmd_pending.get(tid)
         if entry is None:
             log.warning("未知 runcmd task: %s", tid)
             return
-        fut, origin_conn, caller = entry
+        # M4: 校验结果发送者——只有该任务的目标 client 才能 resolve
+        fut, origin_conn, caller, target_name = entry
+        if conn.client_name != target_name:
+            log.warning("runcmd_result 来源不符，拒绝: task=%s from=%s target=%s", tid, conn.client_name, target_name)
+            return
+        self.runcmd_pending.pop(tid, None)
         if not fut.done():
             output = msg.get("output", "")
             if msg.get("root_expired"):
                 output = "[root 会话已过期，已按普通用户执行，请重新 getroot]\n" + output
             fut.set_result((bool(msg.get("ok")), output))
+
+    def _drop_pending_for(self, conn: ClientConnection) -> None:
+        """连接断开时清理其发起的未完成 runcmd/getroot 请求。"""
+        for tid, (fut, origin_conn, _caller, _target) in list(self.runcmd_pending.items()):
+            if origin_conn is conn:
+                self.runcmd_pending.pop(tid, None)
+                if not fut.done():
+                    fut.cancel()
 
     # ---------- 持久化与广播 ----------
 
