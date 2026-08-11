@@ -2189,7 +2189,8 @@ def test_line_limit_constant():
 
 def test_bot_name_from_config(bot):
     assert bot.bot_name == "qsdwindows_bot"
-    assert bot.nickname == "qsdwindows_bot"
+    # pydle 未连接时 self.nickname 为 "<unregistered>"，配置的昵称存于 _nicknames[0]
+    assert bot._nicknames[0] == "qsdwindows_bot"
 
 
 def test_nick_for_userhost(bot):
