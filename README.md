@@ -45,9 +45,11 @@ python -m ircxmppbot client-xmpp
 | `shellop remove <user@host>` | oper | 直接移除 |
 | `confirm/reject <ID>` | botop+ | shellop 提议投票 |
 | `runcmd <client_name> <cmd>` | shellop | 远程 shell（结果私信） |
+| `runcmd getroot <client_root_password>` | shellop | 本 client root 提权（5 分钟有效） |
 
 ## 说明
 
 - oper 身份通过 WHOIS 313 实时检测（ngIRCd 不广播 oper 变更）
 - 白名单/黑名单禁止同时启用；白名单豁免 = 白名单用户 + oper + botop
 - 权限命令生效时原子写回 server.yaml；热重载以文件为准
+- runcmd getroot 使用 su 提权，会话绑定发起用户，仅所在 client 生效，5 分钟过期回退普通用户

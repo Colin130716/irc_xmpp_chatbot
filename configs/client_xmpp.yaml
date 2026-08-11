@@ -28,3 +28,5 @@ llm:
   max_tokens: 1000
   timeout: 60
   max_reply_chars: 1500
+
+root_session_ttl: 300   # getroot 会话有效期（秒）
