@@ -72,7 +72,7 @@ class Permissions:
         for e in entries:
             if "mask" not in e:
                 continue
-            if e.get("channel") and e["channel"] != channel:
+            if e.get("channel") and e["channel"].casefold() != (channel or "").casefold():
                 continue
             if match_mask(hostmask, e["mask"]):
                 return True

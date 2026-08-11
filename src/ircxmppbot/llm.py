@@ -76,7 +76,8 @@ class LLMClient:
     def extract_reply(fmt: str, data: dict) -> str:
         """从响应 JSON 提取回复文本。"""
         if fmt == "openai_chat":
-            return str(data["choices"][0]["message"]["content"])
+            content = data["choices"][0]["message"].get("content")
+            return content if content is not None else "" 
         if fmt == "openai_responses":
             parts = []
             for item in data.get("output", []):

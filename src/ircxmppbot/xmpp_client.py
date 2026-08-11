@@ -252,6 +252,7 @@ class XMPPBot(slixmpp.ClientXMPP):
                     self.connect()
                 # XMLStream.disconnected 是文档化的 Future：断开时完成
                 await self.disconnected
+                attempt = 0  # 连接成功过，重置退避
             except (ConnectionError, OSError) as e:
                 log.warning("XMPP 连接异常: %s", e)
             delay = backoff_delay(attempt)

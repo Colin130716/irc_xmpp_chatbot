@@ -53,10 +53,13 @@ def main(argv: list[str] | None = None) -> int:
     for name in ("server", "client-irc", "client-xmpp"):
         p = sub.add_parser(name)
         p.add_argument("config", nargs="?", default=DEFAULT_CONFIGS[name])
-    parser.add_argument("-d", "--debug", action="store_true")
+        # 每个子命令也接受 -d/--debug（L2：子命令后可用）
+        p.add_argument("-d", "--debug", action="store_true")
+    parser.add_argument("-d", "--debug", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
+    args.debug = args.debug or getattr(args, "debug", False)
 
-    _setup_logging(args.debug)
+    _setup_logging(bool(getattr(args, "debug", False)))
     config_path = Path(args.config)
     try:
         if args.mode == "server":
