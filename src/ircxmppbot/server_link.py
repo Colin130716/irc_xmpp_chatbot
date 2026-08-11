@@ -6,8 +6,6 @@ import asyncio
 import logging
 import ssl
 import time
-from typing import Awaitable, Callable
-
 from .protocol import (
     decode_msg,
     encode_msg,
@@ -25,21 +23,13 @@ RootSession = tuple[str, float]
 class ServerLink:
     """与 server 的 TLS JSON-lines 连接层 + getroot/root 会话管理。
 
-    handler 为可选的 client 特有消息回调（async (link, msg) -> None）；
-    公共消息（runcmd/getroot/auth_ok）由本类处理。
+    仅处理执行类消息（runcmd/getroot/auth_ok），client 为纯执行器。
     """
 
-    def __init__(
-        self,
-        cfg: dict,
-        client_type: str,
-        bot_name: str,
-        handler: Callable[["ServerLink", dict], Awaitable[None]] | None = None,
-    ) -> None:
+    def __init__(self, cfg: dict, client_type: str, bot_name: str) -> None:
         self.cfg = cfg
         self.client_type = client_type
         self.bot_name = bot_name
-        self.handler = handler
         self.root_sessions: dict[str, RootSession] = {}
         self._server_writer: asyncio.StreamWriter | None = None
         self._server_task: asyncio.Task | None = None
@@ -110,8 +100,6 @@ class ServerLink:
         elif t == "auth_ok":
             if not msg.get("ok"):
                 log.error("server 认证失败，请检查 token")
-        elif self.handler is not None:
-            await self.handler(self, msg)
 
     # ---------- root 会话 ----------
 

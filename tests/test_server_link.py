@@ -153,21 +153,20 @@ async def test_exec_runcmd_no_session(link, monkeypatch):
     assert sent and sent[0]["as_root"] is False and sent[0]["root_expired"] is False
 
 
-async def test_on_server_msg_routes_public(link, monkeypatch):
-    """公共消息（runcmd/getroot/auth_ok）由 ServerLink 处理，其余走 handler。"""
-    handled = []
+async def test_on_server_msg_routes_execution(link, monkeypatch):
+    """仅处理 runcmd/getroot/auth_ok；未知消息忽略。"""
+    calls = []
 
-    async def handler(link, msg):
-        handled.append(msg)
+    async def fake_exec_runcmd(msg):
+        calls.append(("runcmd", msg))
 
-    link.handler = handler
+    async def fake_exec_getroot(msg):
+        calls.append(("getroot", msg))
 
-    async def fake_exec(msg):
-        pass
-
-    monkeypatch.setattr(link, "exec_runcmd", fake_exec)
-
+    monkeypatch.setattr(link, "exec_runcmd", fake_exec_runcmd)
+    monkeypatch.setattr(link, "exec_getroot", fake_exec_getroot)
     await link._on_server_msg({"type": "runcmd", "task_id": "t1", "cmd": "id"})
-    await link._on_server_msg({"type": "custom", "foo": 1})
-    assert handled and handled[0]["type"] == "custom"
-    assert len(handled) == 1
+    await link._on_server_msg({"type": "getroot", "task_id": "t2", "password": "pw", "caller_userhost": "u@h"})
+    await link._on_server_msg({"type": "custom", "foo": 1})  # 未知消息忽略
+    await link._on_server_msg({"type": "auth_ok", "ok": True})
+    assert [c[0] for c in calls] == ["runcmd", "getroot"]
