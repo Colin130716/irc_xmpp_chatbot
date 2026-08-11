@@ -153,3 +153,56 @@ async def test_groupchat_without_prefix_ignored(bot, monkeypatch):
     bot._on_groupchat(FakeMsg("just talking", "user1", "room@conference.snikket.example"))
     await asyncio.sleep(0.05)
     assert sent == []
+
+
+# ---------- getroot 提权 ----------
+
+async def test_exec_getroot_success(bot, monkeypatch):
+    sent = []
+
+    async def fake_server_send(msg):
+        sent.append(msg)
+
+    monkeypatch.setattr(bot, "_server_send", fake_server_send)
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            return (b"0\n", b"")
+
+    async def fake_create_subprocess_shell(cmd, **kwargs):
+        assert "su --pty root -c 'id -u'" in cmd
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
+    await bot._exec_getroot({"task_id": "t1", "password": "pw", "caller_userhost": "boss@host.example"})
+    assert sent and sent[0]["as_root"] is True
+    assert "boss@host.example" in bot.root_sessions
+
+
+async def test_exec_runcmd_as_root(bot, monkeypatch):
+    import time as _time
+    bot.root_sessions["boss@host.example"] = ("pw", _time.monotonic() + 300)
+    sent = []
+    commands = []
+
+    async def fake_server_send(msg):
+        sent.append(msg)
+
+    monkeypatch.setattr(bot, "_server_send", fake_server_send)
+
+    class FakeProc:
+        returncode = 0
+
+        async def communicate(self):
+            return (b"uid=0(root)\n", b"")
+
+    async def fake_create_subprocess_shell(cmd, **kwargs):
+        commands.append(cmd)
+        return FakeProc()
+
+    monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
+    await bot._exec_runcmd({"task_id": "t1", "cmd": "id", "caller_userhost": "boss@host.example"})
+    assert commands and "su --pty root -c" in commands[0]
+    assert sent and sent[0]["as_root"] is True
