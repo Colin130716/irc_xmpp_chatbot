@@ -1,0 +1,24 @@
+server:
+  listen_host: 0.0.0.0
+  listen_port: 8443
+  tls:
+    certfile: server.crt
+    keyfile: server.key
+  token: "change-me-shared-secret"
+  oper_cache_ttl: 60
+  shellop_confirm_timeout: 60
+
+permissions:
+  botop:
+    - "user1@host.example"
+  shellop:
+    - "user2@host.example"
+  whitelist:
+    enabled: false
+    entries:
+      - mask: "user1!*@*.example"
+        channel: "#chan1"
+  blacklist:
+    enabled: false
+    entries:
+      - mask: "bad!*@*"
