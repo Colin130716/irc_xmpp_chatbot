@@ -15,6 +15,7 @@ VALID_TYPES = frozenset(
         "vote",
         "runcmd",
         "runcmd_result",
+        "getroot",
         "status",
     }
 )
@@ -121,9 +122,36 @@ def make_vote(proposal_id: str, vote: str, voter_userhost: str) -> dict:
     }
 
 
-def make_runcmd(task_id: str, cmd: str) -> dict:
-    return {"type": "runcmd", "task_id": task_id, "cmd": cmd}
+def make_runcmd(task_id: str, cmd: str, caller_userhost: str = "") -> dict:
+    return {
+        "type": "runcmd",
+        "task_id": task_id,
+        "cmd": cmd,
+        "caller_userhost": caller_userhost,
+    }
 
 
-def make_runcmd_result(task_id: str, ok: bool, output: str) -> dict:
-    return {"type": "runcmd_result", "task_id": task_id, "ok": ok, "output": output}
+def make_getroot(task_id: str, password: str, caller_userhost: str) -> dict:
+    return {
+        "type": "getroot",
+        "task_id": task_id,
+        "password": password,
+        "caller_userhost": caller_userhost,
+    }
+
+
+def make_runcmd_result(
+    task_id: str,
+    ok: bool,
+    output: str,
+    as_root: bool = False,
+    root_expired: bool = False,
+) -> dict:
+    return {
+        "type": "runcmd_result",
+        "task_id": task_id,
+        "ok": ok,
+        "output": output,
+        "as_root": as_root,
+        "root_expired": root_expired,
+    }
