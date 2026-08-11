@@ -116,7 +116,7 @@ async def test_maybe_command_unknown_goes_to_server(bot, monkeypatch):
     async def fake_whois(nick):
         return {"username": "user1", "hostname": "host.example", "oper": False}
 
-    monkeypatch.setattr(bot, "_server_send", fake_server_send)
+    monkeypatch.setattr(bot.link, "send", fake_server_send)
     monkeypatch.setattr(bot, "_whois_user", fake_whois)
     await bot._maybe_command("!qsdwindows_bot botop give a@b", "user1", "#chan1", is_channel=True)
     assert sent and sent[0]["type"] == "command"
@@ -133,7 +133,7 @@ async def test_confirm_routes_as_vote(bot, monkeypatch):
     async def fake_whois(nick):
         return {"username": "op1", "hostname": "host.example", "oper": True}
 
-    monkeypatch.setattr(bot, "_server_send", fake_server_send)
+    monkeypatch.setattr(bot.link, "send", fake_server_send)
     monkeypatch.setattr(bot, "_whois_user", fake_whois)
     await bot._maybe_command("!qsdwindows_bot confirm ab12cd34", "op1", "#chan1", is_channel=True)
     assert sent and sent[0]["type"] == "vote"
@@ -222,7 +222,7 @@ async def test_exec_getroot_success(bot, monkeypatch):
     async def fake_server_send(msg):
         sent.append(msg)
 
-    monkeypatch.setattr(bot, "_server_send", fake_server_send)
+    monkeypatch.setattr(bot.link, "send", fake_server_send)
 
     class FakeProc:
         returncode = 0
@@ -235,9 +235,9 @@ async def test_exec_getroot_success(bot, monkeypatch):
         return FakeProc()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
-    await bot._exec_getroot({"task_id": "t1", "password": "pw", "caller_userhost": "boss@host.example"})
+    await bot.link.exec_getroot({"task_id": "t1", "password": "pw", "caller_userhost": "boss@host.example"})
     assert sent and sent[0]["as_root"] is True
-    assert "boss@host.example" in bot.root_sessions
+    assert "boss@host.example" in bot.link.root_sessions
 
 
 async def test_exec_getroot_wrong_password(bot, monkeypatch):
@@ -247,7 +247,7 @@ async def test_exec_getroot_wrong_password(bot, monkeypatch):
     async def fake_server_send(msg):
         sent.append(msg)
 
-    monkeypatch.setattr(bot, "_server_send", fake_server_send)
+    monkeypatch.setattr(bot.link, "send", fake_server_send)
 
     class FakeProc:
         returncode = 1
@@ -259,22 +259,22 @@ async def test_exec_getroot_wrong_password(bot, monkeypatch):
         return FakeProc()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
-    await bot._exec_getroot({"task_id": "t1", "password": "bad", "caller_userhost": "boss@host.example"})
+    await bot.link.exec_getroot({"task_id": "t1", "password": "bad", "caller_userhost": "boss@host.example"})
     assert sent and sent[0]["ok"] is False
-    assert "boss@host.example" not in bot.root_sessions
+    assert "boss@host.example" not in bot.link.root_sessions
 
 
 async def test_exec_runcmd_as_root(bot, monkeypatch):
     """有效会话 → 命令被 su 包装执行，回传 as_root=True。"""
     import time as _time
-    bot.root_sessions["boss@host.example"] = ("pw", _time.monotonic() + 300)
+    bot.link.root_sessions["boss@host.example"] = ("pw", _time.monotonic() + 300)
     sent = []
     commands = []
 
     async def fake_server_send(msg):
         sent.append(msg)
 
-    monkeypatch.setattr(bot, "_server_send", fake_server_send)
+    monkeypatch.setattr(bot.link, "send", fake_server_send)
 
     class FakeProc:
         returncode = 0
@@ -287,7 +287,7 @@ async def test_exec_runcmd_as_root(bot, monkeypatch):
         return FakeProc()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
-    await bot._exec_runcmd({"task_id": "t1", "cmd": "id", "caller_userhost": "boss@host.example"})
+    await bot.link.exec_runcmd({"task_id": "t1", "cmd": "id", "caller_userhost": "boss@host.example"})
     assert commands and commands[0][:5] == ("su", "--pty", "root", "-c", "id")
     assert sent and sent[0]["as_root"] is True
 
@@ -295,14 +295,14 @@ async def test_exec_runcmd_as_root(bot, monkeypatch):
 async def test_exec_runcmd_expired(bot, monkeypatch):
     """过期会话 → 普通执行 + root_expired=True。"""
     import time as _time
-    bot.root_sessions["boss@host.example"] = ("pw", _time.monotonic() - 1)
+    bot.link.root_sessions["boss@host.example"] = ("pw", _time.monotonic() - 1)
     sent = []
     commands = []
 
     async def fake_server_send(msg):
         sent.append(msg)
 
-    monkeypatch.setattr(bot, "_server_send", fake_server_send)
+    monkeypatch.setattr(bot.link, "send", fake_server_send)
 
     class FakeProc:
         returncode = 0
@@ -320,7 +320,7 @@ async def test_exec_runcmd_expired(bot, monkeypatch):
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
     monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
-    await bot._exec_runcmd({"task_id": "t1", "cmd": "id", "caller_userhost": "boss@host.example"})
+    await bot.link.exec_runcmd({"task_id": "t1", "cmd": "id", "caller_userhost": "boss@host.example"})
     assert commands and commands[0] == "id"
     assert sent and sent[0]["root_expired"] is True
 
@@ -332,7 +332,7 @@ async def test_exec_runcmd_no_session(bot, monkeypatch):
     async def fake_server_send(msg):
         sent.append(msg)
 
-    monkeypatch.setattr(bot, "_server_send", fake_server_send)
+    monkeypatch.setattr(bot.link, "send", fake_server_send)
 
     class FakeProc:
         returncode = 0
@@ -348,7 +348,7 @@ async def test_exec_runcmd_no_session(bot, monkeypatch):
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
     monkeypatch.setattr(asyncio, "create_subprocess_shell", fake_create_subprocess_shell)
-    await bot._exec_runcmd({"task_id": "t1", "cmd": "id", "caller_userhost": "nobody@host.example"})
+    await bot.link.exec_runcmd({"task_id": "t1", "cmd": "id", "caller_userhost": "nobody@host.example"})
     assert sent and sent[0]["as_root"] is False and sent[0]["root_expired"] is False
 
 
@@ -362,7 +362,7 @@ async def test_dm_proposal_reports_reachable(bot, monkeypatch):
     async def fake_message(nick, text):
         pass
 
-    monkeypatch.setattr(bot, "_server_send", fake_server_send)
+    monkeypatch.setattr(bot.link, "send", fake_server_send)
     monkeypatch.setattr(bot, "message", fake_message)
 
     await bot._dm_proposal({

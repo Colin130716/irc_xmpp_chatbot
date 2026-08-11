@@ -163,7 +163,7 @@ async def test_exec_getroot_success(bot, monkeypatch):
     async def fake_server_send(msg):
         sent.append(msg)
 
-    monkeypatch.setattr(bot, "_server_send", fake_server_send)
+    monkeypatch.setattr(bot.link, "send", fake_server_send)
 
     class FakeProc:
         returncode = 0
@@ -176,21 +176,21 @@ async def test_exec_getroot_success(bot, monkeypatch):
         return FakeProc()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
-    await bot._exec_getroot({"task_id": "t1", "password": "pw", "caller_userhost": "boss@host.example"})
+    await bot.link.exec_getroot({"task_id": "t1", "password": "pw", "caller_userhost": "boss@host.example"})
     assert sent and sent[0]["as_root"] is True
-    assert "boss@host.example" in bot.root_sessions
+    assert "boss@host.example" in bot.link.root_sessions
 
 
 async def test_exec_runcmd_as_root(bot, monkeypatch):
     import time as _time
-    bot.root_sessions["boss@host.example"] = ("pw", _time.monotonic() + 300)
+    bot.link.root_sessions["boss@host.example"] = ("pw", _time.monotonic() + 300)
     sent = []
     commands = []
 
     async def fake_server_send(msg):
         sent.append(msg)
 
-    monkeypatch.setattr(bot, "_server_send", fake_server_send)
+    monkeypatch.setattr(bot.link, "send", fake_server_send)
 
     class FakeProc:
         returncode = 0
@@ -203,6 +203,6 @@ async def test_exec_runcmd_as_root(bot, monkeypatch):
         return FakeProc()
 
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
-    await bot._exec_runcmd({"task_id": "t1", "cmd": "id", "caller_userhost": "boss@host.example"})
+    await bot.link.exec_runcmd({"task_id": "t1", "cmd": "id", "caller_userhost": "boss@host.example"})
     assert commands and commands[0][:5] == ("su", "--pty", "root", "-c", "id")
     assert sent and sent[0]["as_root"] is True

@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import shlex
-import ssl
 import time
 from pathlib import Path
 
@@ -15,16 +13,9 @@ from .commands import parse_command
 from .config import load_yaml
 from .llm import LLMClient, LLMError
 from .permissions import Permissions
-from .protocol import (
-    decode_msg,
-    encode_msg,
-    make_auth,
-    make_command,
-    make_reachability,
-    make_runcmd_result,
-    make_vote,
-)
-from .util import backoff_delay, parse_userhost, split_text_bytes
+from .protocol import make_command, make_reachability, make_vote
+from .server_link import ServerLink
+from .util import parse_userhost, split_text_bytes
 
 log = logging.getLogger(__name__)
 
@@ -50,11 +41,8 @@ class IRCBot(pydle.Client):
         # userhost -> is_oper（本地镜像，来自 server 推送 + 本地 WHOIS）
         self.oper_cache: dict[str, bool] = {}
         self.llm = LLMClient(self.cfg.get("llm", {}))
-        # userhost -> (root 密码, 过期 monotonic 时间)；仅存内存
-        self.root_sessions: dict[str, tuple[str, float]] = {}
-        self._server_reader: asyncio.StreamReader | None = None
-        self._server_writer: asyncio.StreamWriter | None = None
-        self._server_task: asyncio.Task | None = None
+        self.link = ServerLink(self.cfg, "irc", self.bot_name, self._on_link_msg)
+        self.root_sessions = self.link.root_sessions  # 兼容既有测试/外部引用
 
     # ---------- pydle 生命周期 ----------
 
@@ -62,81 +50,28 @@ class IRCBot(pydle.Client):
         await super().on_connect()
         for channel in self.cfg.get("irc", {}).get("channels", []):
             await self.join(channel)
-        if self._server_task is None or self._server_task.done():
-            self._server_task = asyncio.create_task(self._server_loop())
+        await self.link.start()
         log.info("IRC 已连接并加入频道: %s", self.cfg.get("irc", {}).get("channels", []))
 
-    # ---------- server 连接 ----------
+    # ---------- server 连接（共享 ServerLink 处理连接与 runcmd/getroot） ----------
 
-    async def _server_loop(self) -> None:
-        srv_cfg = self.cfg["client"]["server"]
-        attempt = 0
-        while True:
-            try:
-                await self._server_connect(srv_cfg)
-                attempt = 0
-            except (ConnectionError, OSError, asyncio.IncompleteReadError, TimeoutError) as e:
-                delay = backoff_delay(attempt)
-                log.warning("server 连接失败: %s，%.0fs 后重连", e, delay)
-                await asyncio.sleep(delay)
-                attempt += 1
-
-    async def _server_connect(self, srv_cfg: dict) -> None:
-        ssl_ctx = None
-        tls_cfg = srv_cfg.get("tls", {})
-        if tls_cfg:
-            verify = tls_cfg.get("verify", True)
-            ssl_ctx = ssl.create_default_context()
-            if not verify:
-                ssl_ctx.check_hostname = False
-                ssl_ctx.verify_mode = ssl.CERT_NONE
-            if tls_cfg.get("ca_cert"):
-                ssl_ctx.load_verify_locations(tls_cfg["ca_cert"])
-        reader, writer = await asyncio.open_connection(
-            srv_cfg["host"], int(srv_cfg["port"]), ssl=ssl_ctx
-        )
-        self._server_reader, self._server_writer = reader, writer
-        client_cfg = self.cfg["client"]
-        await self._server_send(make_auth(
-            srv_cfg["token"], client_cfg["name"], "irc", self.bot_name
-        ))
-        log.info("已连接 server: %s:%s", srv_cfg["host"], srv_cfg["port"])
-        while True:
-            line = await reader.readline()
-            if not line:
-                raise ConnectionError("server 断开")
-            try:
-                msg = decode_msg(line.decode("utf-8"))
-            except Exception as e:  # noqa: BLE001
-                log.warning("协议错误: %s", e)
-                continue
-            await self._on_server_msg(msg)
-
-    async def _server_send(self, msg: dict) -> None:
-        if self._server_writer is None:
-            raise ConnectionError("未连接 server")
-        self._server_writer.write(encode_msg(msg))
-        await self._server_writer.drain()
-
-    async def _on_server_msg(self, msg: dict) -> None:
+    async def _on_link_msg(self, link: ServerLink, msg: dict) -> None:
+        """处理 client 特有消息；连接/runcmd/getroot/auth_ok 由 ServerLink 处理。"""
         t = msg.get("type")
-        if t == "auth_ok":
-            if not msg.get("ok"):
-                log.error("server 认证失败，请检查 token")
-        elif t == "permission_update":
+        if t == "permission_update":
             self.permissions.apply_snapshot(msg)
             self.oper_cache = {parse_userhost(k): bool(v) for k, v in (msg.get("oper_cache") or {}).items()}
             await self._enforce_lists_all_channels()
         elif t == "shellop_proposal":
             await self._dm_proposal(msg)
-        elif t == "runcmd":
-            await self._exec_runcmd(msg)
-        elif t == "getroot":
-            await self._exec_getroot(msg)
         elif t == "command_result":
             await self._handle_command_result(msg)
         else:
             log.debug("忽略 server 消息: %s", t)
+
+    async def _server_send(self, msg: dict) -> None:
+        # 兼容别名：统一走 ServerLink.send
+        await self.link.send(msg)
 
     # ---------- 命令处理 ----------
 
@@ -239,72 +174,7 @@ class IRCBot(pydle.Client):
 
     # ---------- runcmd 执行 ----------
 
-    def _root_session_ttl(self) -> float:
-        return float(self.cfg.get("root_session_ttl", 300))
-
-    def _root_session_lookup(self, caller: str) -> tuple[tuple[str, float] | None, bool]:
-        """查找会话；返回 (条目, 是否曾有过但已过期)。清理过期条目防泄漏（M2）。"""
-        now = time.monotonic()
-        expired_prev = False
-        entry = self.root_sessions.get(caller)
-        if entry is not None and entry[1] <= now:
-            expired_prev = True
-            del self.root_sessions[caller]
-            entry = None
-        return entry, expired_prev
-
-    async def _exec_getroot(self, msg: dict) -> None:
-        task_id = msg["task_id"]
-        password = msg["password"]
-        caller = parse_userhost(msg.get("caller_userhost", ""))
-        log.info("getroot 验证请求（user=%s）", caller)
-        proc = await asyncio.create_subprocess_exec(
-            "su", "--pty", "root", "-c", "id -u",
-            stdin=asyncio.subprocess.PIPE,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.STDOUT,
-        )
-        stdout, _ = await proc.communicate(input=(password + "\n").encode("utf-8"))
-        ok = proc.returncode == 0 and stdout.strip() == b"0"
-        if ok and caller:
-            self._root_session_lookup(caller)[0]  # 清理过期条目
-            self.root_sessions[caller] = (password, time.monotonic() + self._root_session_ttl())
-            output = f"root 已激活（{int(self._root_session_ttl())} 秒有效）"
-            log.info("getroot 成功: %s", caller)
-        else:
-            output = "root 密码验证失败"
-            log.warning("getroot 失败: %s", caller)
-        await self._server_send(make_runcmd_result(task_id, ok, output, as_root=ok))
-
-    async def _exec_runcmd(self, msg: dict) -> None:
-        task_id = msg["task_id"]
-        cmd = msg["cmd"]
-        caller = parse_userhost(msg.get("caller_userhost", ""))
-        entry, root_expired = self._root_session_lookup(caller)
-        as_root = False
-        if entry:
-            as_root = True
-            password = entry[0]
-            log.info("执行 runcmd (root=%s): %s", as_root, cmd)
-            proc = await asyncio.create_subprocess_exec(
-                "su", "--pty", "root", "-c", cmd,
-                stdin=asyncio.subprocess.PIPE,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-            stdout, _ = await proc.communicate(input=(password + "\n").encode("utf-8"))
-        else:
-            log.info("执行 runcmd (root=%s): %s", as_root, cmd)
-            proc = await asyncio.create_subprocess_shell(
-                cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
-            stdout, _ = await proc.communicate()
-        output = stdout.decode("utf-8", errors="replace")
-        await self._server_send(make_runcmd_result(
-            task_id, proc.returncode == 0, output, as_root=as_root, root_expired=root_expired
-        ))
+    # root 会话与 getroot/runcmd 执行已移至 ServerLink（self.link）
 
     # ---------- 命令结果（含 ban/unban 动作） ----------
 
