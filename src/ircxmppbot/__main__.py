@@ -1,4 +1,4 @@
-"""CLI 入口：python -m ircxmppbot server|client-irc|client-xmpp [config]"""
+"""CLI 入口：python -m ircxmppbot server|client [config]"""
 
 from __future__ import annotations
 
@@ -14,8 +14,7 @@ log = logging.getLogger(__name__)
 
 DEFAULT_CONFIGS = {
     "server": "configs/server.yaml",
-    "client-irc": "configs/client_irc.yaml",
-    "client-xmpp": "configs/client_xmpp.yaml",
+    "client": "configs/client.yaml",
 }
 
 
@@ -36,28 +35,21 @@ async def _run_server(config_path: Path) -> None:
     await server.run()
 
 
-async def _run_client(config_path: Path, kind: str) -> None:
-    if kind == "irc":
-        from .irc_client import IRCBot
+async def _run_client(config_path: Path) -> None:
+    from .client import ShellClient
 
-        await IRCBot(config_path).run()
-    else:
-        from .xmpp_client import XMPPBot
-
-        await XMPPBot(config_path).run()
+    await ShellClient(config_path).run()
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="ircxmppbot")
     sub = parser.add_subparsers(dest="mode", required=True)
-    for name in ("server", "client-irc", "client-xmpp"):
+    for name in ("server", "client"):
         p = sub.add_parser(name)
         p.add_argument("config", nargs="?", default=DEFAULT_CONFIGS[name])
-        # 每个子命令也接受 -d/--debug（L2：子命令后可用）
         p.add_argument("-d", "--debug", action="store_true")
     parser.add_argument("-d", "--debug", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args(argv)
-    args.debug = args.debug or getattr(args, "debug", False)
 
     _setup_logging(bool(getattr(args, "debug", False)))
     config_path = Path(args.config)
@@ -65,8 +57,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.mode == "server":
             asyncio.run(_run_server(config_path))
         else:
-            kind = args.mode.removeprefix("client-")
-            asyncio.run(_run_client(config_path, kind))
+            asyncio.run(_run_client(config_path))
     except KeyboardInterrupt:
         log.info("收到中断信号，退出")
     except Exception as e:  # noqa: BLE001

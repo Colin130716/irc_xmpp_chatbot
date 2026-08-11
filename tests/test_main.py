@@ -11,20 +11,18 @@ def test_sample_server_config_loads():
     assert "whitelist" in cfg["permissions"] and "blacklist" in cfg["permissions"]
 
 
-def test_sample_irc_config_loads():
-    cfg = load_yaml(Path("configs/client_irc.yaml"))
-    assert cfg["client"]["type"] == "irc"
-    assert cfg["client"]["bot_name"]
-    assert "irc" in cfg and "llm" in cfg
-    assert "realname" in cfg["irc"]
-    assert cfg["irc"]["channels"]
+def test_sample_client_config_loads():
+    cfg = load_yaml(Path("configs/client.yaml"))
+    assert "client" in cfg
+    assert "name" in cfg["client"]
+    assert "server" in cfg["client"]
+    assert "token" in cfg["client"]["server"]
 
 
-def test_sample_xmpp_config_loads():
-    cfg = load_yaml(Path("configs/client_xmpp.yaml"))
-    assert cfg["client"]["type"] == "xmpp"
-    assert "xmpp" in cfg and "llm" in cfg
-    assert "jid" in cfg["xmpp"]
+def test_server_config_has_irc_or_xmpp():
+    cfg = load_yaml(Path("configs/server.yaml"))
+    # irc/xmpp 段可选：样例中至少有一个
+    assert "irc" in cfg or "xmpp" in cfg
 
 
 def test_protocol_auth_roundtrip():

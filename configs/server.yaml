@@ -8,17 +8,44 @@ server:
   oper_cache_ttl: 60
   shellop_confirm_timeout: 60
 
+irc:
+  host: irc.example.com
+  port: 6697
+  tls: true
+  tls_verify: true
+  bot_name: qsdwindows_bot
+  realname: "My IRC Bot"
+  channels:
+    - "#chan1"
+
+xmpp:
+  jid: "bot@snikket.example"
+  password: "change-me"
+  host: "snikket.example"
+  port: 5222
+  tls: true
+  bot_name: qsdwindows_bot
+  mucs:
+    - "room@conference.snikket.example"
+
+llm:
+  format: openai_chat
+  base_url: "https://api.openai.com/v1"
+  api_key: "sk-xxx"
+  model: "gpt-4o-mini"
+  system_prompt: "You are a helpful bot."
+  temperature: 0.7
+  max_tokens: 1000
+  timeout: 60
+  max_reply_chars: 1500
+
 permissions:
   botop:
     - "user1@host.example"
-  shellop:
-    - "user2@host.example"
+  shellop: []
   whitelist:
     enabled: false
-    entries:
-      - mask: "user1!*@*.example"
-        channel: "#chan1"
+    entries: []
   blacklist:
     enabled: false
-    entries:
-      - mask: "bad!*@*"
+    entries: []

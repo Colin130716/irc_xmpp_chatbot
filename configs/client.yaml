@@ -1,0 +1,9 @@
+client:
+  name: shell_node_1
+  server:
+    host: 127.0.0.1
+    port: 8443
+    token: "change-me-shared-secret"
+    tls:
+      verify: false
+root_session_ttl: 300
