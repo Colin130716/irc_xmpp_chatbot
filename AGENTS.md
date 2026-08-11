@@ -38,7 +38,7 @@ $PY -m ircxmppbot server configs/server.yaml   # 启动（需真实证书/服务
 
 - **confirm/reject 走 `vote` 消息**（server 无 `_cmd_confirm/_cmd_reject` 处理器）——irc_client `_maybe_command` 特判路由到 `_server_vote`。
 - **getroot**：`runcmd getroot <pw>` 是 server 特判子命令（目标=调用者所在 client），密码存 client 内存 `root_sessions`（5 分钟 TTL，`root_session_ttl` 配置），过期回退普通用户并提示。密码**不可**进日志或 `cmd` 字段；经 `su --pty` 的 stdin 传递（不进 argv，`ps` 不可见）。
-- **shellop 确认（M8）**：投票人须可触达——client 私信可达投票人后回传 `reachability` 消息，server 收集窗口（2s）后定稿 voters，仅发起者可触达则直接通过。
+- **shellop 确认（M8）**：投票人须可触达——client 私信可达投票人后回传 `reachability` 消息，server 收集窗口（2s，只计 IRC 型 client）后定稿 voters，仅发起者可触达则直接通过。收集期内投票被拒；`reachability` 按 conn 去重且只接受 `initial_voters` 内 userhost。
 - 权限判定在 server 端：client 上报 `command`（含 caller_userhost + caller_is_oper），server 查权限表后返回 `command_result`。
 
 ## 库版本特性（易踩坑）
