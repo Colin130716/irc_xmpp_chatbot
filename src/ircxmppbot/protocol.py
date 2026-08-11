@@ -1,4 +1,4 @@
-"""server↔client 协议：JSON lines 编解码与消息构造器。"""
+"""server↔client 协议：JSON lines 编解码与消息构造器（仅执行类消息）。"""
 
 from __future__ import annotations
 
@@ -8,15 +8,9 @@ VALID_TYPES = frozenset(
     {
         "auth",
         "auth_ok",
-        "command",
-        "command_result",
-        "permission_update",
-        "shellop_proposal",
-        "vote",
         "runcmd",
         "runcmd_result",
         "getroot",
-        "reachability",
         "status",
     }
 )
@@ -34,13 +28,11 @@ def _validate(msg: dict) -> None:
 
 
 def encode_msg(msg: dict) -> bytes:
-    """将消息编码为 JSON line（UTF-8，以 \\n 结尾）。"""
     _validate(msg)
     return (json.dumps(msg, ensure_ascii=False, separators=(",", ":")) + "\n").encode("utf-8")
 
 
 def decode_msg(line: str) -> dict:
-    """解析单行 JSON 消息。"""
     line = line.strip()
     if not line:
         raise ProtocolError("空行")
@@ -59,75 +51,6 @@ def make_auth(token: str, client_name: str, client_type: str, bot_name: str) -> 
         "client_name": client_name,
         "client_type": client_type,
         "bot_name": bot_name,
-    }
-
-
-def make_command(
-    cmd: str,
-    args: list[str],
-    caller_userhost: str,
-    caller_is_oper: bool,
-    channel: str | None = None,
-) -> dict:
-    return {
-        "type": "command",
-        "cmd": cmd,
-        "args": args,
-        "caller_userhost": caller_userhost,
-        "caller_is_oper": caller_is_oper,
-        "channel": channel,
-    }
-
-
-def make_command_result(
-    ok: bool,
-    reply: str,
-    target_type: str,
-    target: str,
-    action: str = "none",
-    action_args: list[str] | None = None,
-) -> dict:
-    return {
-        "type": "command_result",
-        "ok": ok,
-        "reply": reply,
-        "target_type": target_type,
-        "target": target,
-        "action": action,
-        "action_args": action_args or [],
-    }
-
-
-def make_permission_update(snapshot: dict, oper_cache: dict) -> dict:
-    return {"type": "permission_update", **snapshot, "oper_cache": oper_cache}
-
-
-def make_shellop_proposal(
-    proposal_id: str, candidate: str, deadline_ts: float, voters: list[str]
-) -> dict:
-    return {
-        "type": "shellop_proposal",
-        "proposal_id": proposal_id,
-        "candidate": candidate,
-        "deadline_ts": deadline_ts,
-        "voters": voters,
-    }
-
-
-def make_reachability(proposal_id: str, reachable: list[str]) -> dict:
-    return {
-        "type": "reachability",
-        "proposal_id": proposal_id,
-        "reachable": reachable,
-    }
-
-
-def make_vote(proposal_id: str, vote: str, voter_userhost: str) -> dict:
-    return {
-        "type": "vote",
-        "proposal_id": proposal_id,
-        "vote": vote,
-        "voter_userhost": voter_userhost,
     }
 
 
