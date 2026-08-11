@@ -32,8 +32,6 @@ class XMPPSession(slixmpp.ClientXMPP):
         self.add_event_handler("session_start", self._session_start)
         self.add_event_handler("message", self._on_message)
         self.add_event_handler("groupchat_message", self._on_groupchat)
-        # LLM 在 server 上，session 通过 server 调用
-        self.llm = self.srv.llm
 
     async def _session_start(self, event) -> None:
         await self.get_roster()
@@ -61,8 +59,9 @@ class XMPPSession(slixmpp.ClientXMPP):
         parsed = parse_command(body, self.bot_name)
         if parsed is None or parsed.cmd != "chat":
             return
+        caller = msg["from"].resource or msg["from"].bare
         asyncio.create_task(self.srv.handle_chat_command(
-            "chat", parsed.args, msg["from"].bare, False, msg["from"].bare, self
+            "chat", parsed.args, caller, False, msg["from"].bare, self
         ))
 
     async def _handle_private(self, sender: str, body: str) -> None:

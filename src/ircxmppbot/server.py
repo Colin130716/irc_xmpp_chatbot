@@ -88,7 +88,6 @@ class BotServer:
         self.permissions = Permissions.from_config(cfg)
         self.llm = LLMClient(cfg.get("llm", {}))
         self.cfg = cfg
-        asyncio.create_task(self._broadcast_permissions())
 
     def oper_cache_ttl(self) -> float:
         return float(self.cfg.get("server", {}).get("oper_cache_ttl", 60))
@@ -209,7 +208,8 @@ class BotServer:
             await target.reply("XMPP 端仅支持 chat 命令", channel, None)
             return
         uh = parse_userhost(caller_userhost)
-        if uh:
+        # L3: 仅 IRC 会话写入 oper_cache（XMPP jid 无 oper 概念，避免污染）
+        if uh and target.session_type == "irc":
             self.oper_cache[uh] = (is_oper, time.monotonic())
         required = COMMAND_LEVELS.get(cmd)
         if required is None:
@@ -255,7 +255,7 @@ class BotServer:
             reply = await self.llm.chat(text)
         except Exception as e:  # noqa: BLE001 - LLM 错误不致命
             reply = f"LLM 错误: {e}"
-        await target.reply(reply, channel, None)
+        await target.reply(reply, channel, caller if channel is None else None)
 
     async def _cmd_help(self, target, args, caller, is_oper, channel) -> None:
         await target.reply(
@@ -329,7 +329,11 @@ class BotServer:
         self.proposals[proposal_id] = prop
         prop["task"] = asyncio.create_task(self._proposal_timer(proposal_id))
         # 收集可达投票人（dm_voters 取代 reachability 消息）
-        reachable = await target.dm_voters(proposal_id, uh, sorted(voters), deadline_ts)
+        try:
+            reachable = await target.dm_voters(proposal_id, uh, sorted(voters), deadline_ts)
+        except (ConnectionError, OSError):
+            # M2: 会话异常时回退为仅发起者可投票（避免提议卡死）
+            reachable = [caller]
         prop["voters"] = set(reachable) | {caller}
         # 仅发起者一人可触达 → 直接通过
         if len(prop["voters"]) <= 1:
@@ -357,6 +361,33 @@ class BotServer:
         await asyncio.sleep(wait)
         if proposal_id in self.proposals:
             await self._finalize_proposal(proposal_id, success=False, reason="超时作废")
+
+    async def _cmd_confirm(self, target, args, caller, is_oper, channel) -> None:
+        await self._cmd_vote(target, args, caller, "confirm")
+
+    async def _cmd_reject(self, target, args, caller, is_oper, channel) -> None:
+        await self._cmd_vote(target, args, caller, "reject")
+
+    async def _cmd_vote(self, target, args, caller, vote: str) -> None:
+        if not args:
+            await target.reply(f"用法: {vote} <提议ID>", None, caller)
+            return
+        proposal_id = args[0]
+        prop = self.proposals.get(proposal_id)
+        if prop is None:
+            await target.reply(f"提议 {proposal_id} 不存在或已结束", None, caller)
+            return
+        # 校验投票人资格：必须在该提议的 voters 集内
+        if caller not in prop["voters"]:
+            await target.reply("你不是该提议的投票人", None, caller)
+            return
+        if caller in prop["votes"]:
+            await target.reply("你已投过票", None, caller)
+            return
+        await self._handle_vote(caller, vote, proposal_id)
+        prop = self.proposals.get(proposal_id)
+        if prop is not None:
+            await target.reply(f"已记录{vote}（{len(prop['votes'])}/{len(prop['voters'])}）", None, caller)
 
     async def _handle_vote(self, voter: str, vote: str, proposal_id: str) -> None:
         prop = self.proposals.get(proposal_id)
@@ -473,26 +504,23 @@ class BotServer:
             await target.reply("用法: runcmd <client_name> <cmd...>", channel, caller)
             return
         if args[0] == "getroot":
-            if len(args) < 2 or not args[1]:
-                await target.reply("用法: runcmd getroot <client_root_password>", channel, caller)
+            if len(args) < 3 or not args[2]:
+                await target.reply("用法: runcmd getroot <client_name> <client_root_password>", channel, caller)
                 return
-            password = args[1]
+            target_name = args[1]
+            password = args[2]
+            conn = self.conns.get(target_name)
+            if conn is None:
+                await target.reply(f"client {target_name} 不在线", channel, caller)
+                return
             task_id = uuid.uuid4().hex
             fut: asyncio.Future = asyncio.get_running_loop().create_future()
-            self.runcmd_pending[task_id] = (fut, target, caller, None)  # getroot 目标=任一执行器
-            # getroot 发往任意在线 client 执行器
-            client_name = next(iter(self.conns), None)
-            if client_name is None:
-                self.runcmd_pending.pop(task_id, None)
-                await target.reply("没有在线 client 执行器", channel, caller)
-                return
-            conn = self.conns[client_name]
-            self.runcmd_pending[task_id] = (fut, target, caller, conn.client_name)
+            self.runcmd_pending[task_id] = (fut, target, caller, target_name)
             try:
                 await conn.send(make_getroot(task_id, password, caller))
             except (ConnectionError, OSError):
                 self.runcmd_pending.pop(task_id, None)
-                await target.reply("client 连接异常", channel, caller)
+                await target.reply(f"client {target_name} 连接异常", channel, caller)
                 return
             try:
                 ok, output = await asyncio.wait_for(fut, timeout=RUNCMD_TIMEOUT)
@@ -564,8 +592,4 @@ class BotServer:
                 yaml.safe_dump(self.cfg, f, allow_unicode=True, sort_keys=False)
             os.replace(tmp, self.config_path)
 
-    def _permission_update_msg(self) -> dict:
-        return {"type": "permission_update"}  # 兼容占位（协议已无此消息，仅保留空壳）
-
-    async def _broadcast_permissions(self) -> None:
-        pass  # 协议精简后无 permission_update 消息；权限数据 server 本地持有
+    # 协议精简后无 permission_update 消息；权限数据 server 本地持有，无需广播

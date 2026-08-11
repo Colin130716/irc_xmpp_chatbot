@@ -253,7 +253,7 @@ async def test_runcmd_getroot_routes_to_client(srv):
     srv.permissions.shellop.add("boss@host.example")
 
     task = asyncio.create_task(
-        srv._cmd_runcmd(target, ["getroot", "secretpw"], "boss@host.example", False, "#chan")
+        srv._cmd_runcmd(target, ["getroot", "shell_node_1", "secretpw"], "boss@host.example", False, "#chan")
     )
     for _ in range(100):
         if any(m["type"] == "getroot" for m in client_conn.sent):
@@ -277,3 +277,75 @@ async def test_handle_chat_command_xmpp_restricted(srv):
     target.session_type = "xmpp"
     await srv.handle_chat_command("ban", ["x"], "user@snikket.example", False, None, target)
     assert "仅支持 chat" in _last(target)[0]
+
+
+# ---------- 复审回归：confirm/reject 端到端投票 ----------
+
+async def test_confirm_vote_completes_proposal(srv):
+    """R1: confirm 命令驱动投票 → 全员同意 → shellop 生效。"""
+    target = FakeTarget()
+    srv.oper_cache["op2@host.example"] = (True, time.monotonic())
+    srv.permissions.botop.add("op2@host.example")
+    await _cmd(srv, target, "shellop", ["add", "op2@host.example"], "op1@host.example", is_oper=True)
+    assert target.dm_reachable, "应调用 dm_voters"
+    pid = next(iter(srv.proposals))  # 唯一提议
+    prop = srv.proposals[pid]
+    # 发起者 op1 自动同意；voters 定稿为可达集合
+    assert "op1@host.example" in prop["votes"]
+
+    # op2 用 confirm 命令投票 → 全员同意 → shellop 生效
+    await _cmd(srv, target, "confirm", [pid], "op2@host.example", is_oper=True)
+    assert "op2@host.example" in srv.permissions.shellop
+    assert pid not in srv.proposals  # 提议已结束
+
+
+async def test_reject_vote_denies_proposal(srv):
+    """R1: reject 命令投票 → 提议否决。"""
+    target = FakeTarget()
+    srv.oper_cache["op2@host.example"] = (True, time.monotonic())
+    srv.permissions.botop.add("op2@host.example")
+    await _cmd(srv, target, "shellop", ["add", "op2@host.example"], "op1@host.example", is_oper=True)
+    pid = next(iter(srv.proposals))
+
+    await _cmd(srv, target, "reject", [pid], "op2@host.example", is_oper=True)
+    assert "op2@host.example" not in srv.permissions.shellop
+    assert pid not in srv.proposals  # 提议已否决并结束
+
+
+async def test_confirm_by_non_voter_rejected(srv):
+    """R1: 非投票人的 confirm 被拒。"""
+    target = FakeTarget()
+    srv.oper_cache["op2@host.example"] = (True, time.monotonic())
+    srv.permissions.botop.add("op2@host.example")
+    await _cmd(srv, target, "shellop", ["add", "op2@host.example"], "op1@host.example", is_oper=True)
+    pid = next(iter(srv.proposals))
+    prop = srv.proposals[pid]
+    # 把 op2 从可达名单移除（模拟 op2 不可达）
+    prop["voters"] = {"op1@host.example"}
+
+    # 非投票人 stranger 尝试 confirm → 拒绝
+    await _cmd(srv, target, "confirm", [pid], "stranger@host.example", is_oper=True)
+    assert "你不是该提议的投票人" in target.replied[-1][0]
+    assert pid in srv.proposals  # 提议未被影响
+
+
+async def test_chat_private_reply_uses_caller(srv):
+    """R2/R3: chat 私信（channel=None）回复到 caller。"""
+    target = FakeTarget()
+
+    class FakeLLM:
+        async def chat(self, text):
+            return "hello back"
+
+    srv.llm = FakeLLM()
+    await srv.handle_chat_command("chat", ["hi"], "user@host.example", False, None, target)
+    # 私信：channel=None → private_to=caller
+    assert target.replied and target.replied[-1] == ("hello back", None, "user@host.example")
+
+
+async def test_getroot_requires_client_name(srv):
+    """M1: getroot 缺 client_name 时报用法。"""
+    target = FakeTarget()
+    srv.permissions.shellop.add("boss@host.example")
+    await _cmd(srv, target, "runcmd", ["getroot", "secretpw"], "boss@host.example")
+    assert "用法" in _last(target)[0]

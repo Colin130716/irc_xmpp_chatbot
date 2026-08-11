@@ -41,8 +41,8 @@ $PY -m ircxmppbot client configs/client.yaml   # 启动 shell 执行器
 - **命令在 server 本地处理**：IRCSession/XMPPSession 收到聊天消息 → `server.handle_chat_command(...)` → 复用 `_cmd_*` 处理器（`ChatTarget` 抽象回复）。无 command 消息上报。
 - **ChatTarget**：`_cmd_*` 的第一个参数（原 conn）。`reply(text, channel, private_to)` 发回复，`execute(action, args, channel)` 执行频道动作（ban/unban MODE），`dm_voters(...)` 私信 shellop 投票人。
 - **XMPP 限制**：`handle_chat_command` 对 xmpp session 仅放行 chat/help；XMPP 用户 userhost 用 jid 映射，is_oper 恒 False。
-- **confirm/reject**：shellop 投票私信在 IRCSession 的 `dm_voters` 私信中提示，投票经 `_handle_vote`（server 内部）。
-- **getroot**：`runcmd getroot <pw>` 由 server 转发到在线 client 执行器，密码存 client 内存 `root_sessions`（5 分钟 TTL），过期回退普通用户并提示。密码**不可**进日志或 `cmd` 字段；经 `su --pty` 的 stdin 传递（不进 argv）。
+- **confirm/reject**：`_cmd_confirm`/`_cmd_reject` 处理器（botop+）调 `_handle_vote`；shellop 投票私信在 IRCSession 的 `dm_voters` 私信中提示。
+- **getroot**：`runcmd getroot <client_name> <pw>` 由 server 转发到指定 client 执行器，密码存 client 内存 `root_sessions`（5 分钟 TTL），过期回退普通用户并提示。密码**不可**进日志或 `cmd` 字段；经 `su --pty` 的 stdin 传递（不进 argv）。
 - **shellop 确认（M8）**：投票人须可触达——`dm_voters` 私信可达投票人并返回名单，仅发起者可触达则直接通过。
 
 ## 库版本特性（易踩坑）
