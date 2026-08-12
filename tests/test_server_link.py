@@ -1,10 +1,12 @@
 import asyncio
+import logging
+import ssl
 import time
 from pathlib import Path
 
 import pytest
 
-from ircxmppbot.server_link import ServerLink
+from ircxmppbot.server_link import ServerLink, build_client_ssl_ctx
 
 
 def _write_cfg(tmp_path: Path) -> Path:
@@ -170,3 +172,37 @@ async def test_on_server_msg_routes_execution(link, monkeypatch):
     await link._on_server_msg({"type": "custom", "foo": 1})  # 未知消息忽略
     await link._on_server_msg({"type": "auth_ok", "ok": True})
     assert [c[0] for c in calls] == ["runcmd", "getroot"]
+
+
+# ---------- TLS 可选（统一判定） ----------
+
+class _BreakLoop(Exception):
+    pass
+
+
+def test_build_client_ssl_ctx_disabled():
+    assert build_client_ssl_ctx(None) is None
+    assert build_client_ssl_ctx({}) is None
+    assert build_client_ssl_ctx({"enabled": False}) is None
+
+
+def test_build_client_ssl_ctx_default_enabled():
+    ctx = build_client_ssl_ctx({"verify": False})
+    assert ctx is not None
+    assert ctx.check_hostname is False
+    assert ctx.verify_mode == ssl.CERT_NONE
+
+
+async def test_server_loop_tls_mismatch_logs_hint(link, monkeypatch, caplog):
+    async def fake_connect(cfg):
+        raise ssl.SSLError("wrong version number")
+
+    async def fake_sleep(delay):
+        raise _BreakLoop()
+
+    monkeypatch.setattr(link, "_server_connect", fake_connect)
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+    with caplog.at_level(logging.WARNING):
+        with pytest.raises(_BreakLoop):
+            await link._server_loop()
+    assert "TLS 握手失败" in caplog.text

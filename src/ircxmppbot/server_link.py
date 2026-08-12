@@ -12,12 +12,26 @@ from .protocol import (
     make_auth,
     make_runcmd_result,
 )
-from .util import backoff_delay, parse_userhost
+from .util import backoff_delay, parse_userhost, tls_enabled
 
 log = logging.getLogger(__name__)
 
 # userhost -> (root 密码, 过期 monotonic 时间)；仅存内存
 RootSession = tuple[str, float]
+
+
+def build_client_ssl_ctx(tls_cfg: dict | None) -> ssl.SSLContext | None:
+    """构建 client 端 SSLContext；TLS 未启用返回 None。"""
+    if not tls_enabled(tls_cfg):
+        return None
+    ctx = ssl.create_default_context()
+    verify = tls_cfg.get("verify", True)
+    if not verify:
+        ctx.check_hostname = False
+        ctx.verify_mode = ssl.CERT_NONE
+    if tls_cfg.get("ca_cert"):
+        ctx.load_verify_locations(tls_cfg["ca_cert"])
+    return ctx
 
 
 class ServerLink:
@@ -48,6 +62,11 @@ class ServerLink:
             try:
                 await self._server_connect(srv_cfg)
                 attempt = 0
+            except ssl.SSLError as e:
+                log.warning("TLS 握手失败（server 可能未启用 TLS，或两端 tls 配置不匹配）: %s", e)
+                delay = backoff_delay(attempt)
+                await asyncio.sleep(delay)
+                attempt += 1
             except (ConnectionError, OSError, asyncio.IncompleteReadError, TimeoutError) as e:
                 delay = backoff_delay(attempt)
                 log.warning("server 连接失败: %s，%.0fs 后重连", e, delay)
@@ -55,16 +74,7 @@ class ServerLink:
                 attempt += 1
 
     async def _server_connect(self, srv_cfg: dict) -> None:
-        ssl_ctx = None
-        tls_cfg = srv_cfg.get("tls", {})
-        if tls_cfg:
-            verify = tls_cfg.get("verify", True)
-            ssl_ctx = ssl.create_default_context()
-            if not verify:
-                ssl_ctx.check_hostname = False
-                ssl_ctx.verify_mode = ssl.CERT_NONE
-            if tls_cfg.get("ca_cert"):
-                ssl_ctx.load_verify_locations(tls_cfg["ca_cert"])
+        ssl_ctx = build_client_ssl_ctx(srv_cfg.get("tls"))
         reader, writer = await asyncio.open_connection(
             srv_cfg["host"], int(srv_cfg["port"]), ssl=ssl_ctx
         )
