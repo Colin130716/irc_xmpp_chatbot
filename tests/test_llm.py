@@ -120,3 +120,112 @@ async def test_chat_ok(monkeypatch):
 
     monkeypatch.setattr("httpx.AsyncClient", FakeClient)
     assert await client.chat("hello") == "hi"
+
+
+# ---------- 思考开关与深度配置 ----------
+
+CFG_THINK = {
+    **CFG,
+    "thinking": "enabled",
+    "reasoning_effort": "high",
+}
+
+
+def test_build_openai_chat_with_thinking():
+    client = LLMClient(CFG_THINK)
+    _, _, body = client.build_request("hello")
+    assert body["thinking"] == "enabled"
+    assert body["reasoning_effort"] == "high"
+
+
+def test_build_openai_chat_without_thinking():
+    client = LLMClient(CFG)
+    _, _, body = client.build_request("hello")
+    assert "thinking" not in body
+    assert "reasoning_effort" not in body
+
+
+def test_build_openai_responses_with_thinking():
+    client = LLMClient({**CFG_THINK, "format": "openai_responses"})
+    _, _, body = client.build_request("hello")
+    assert body["thinking"] == "enabled"
+    assert body["reasoning_effort"] == "high"
+
+
+def test_build_anthropic_thinking_string_adaptive():
+    client = LLMClient({**CFG, "format": "anthropic", "thinking": "adaptive"})
+    _, _, body = client.build_request("hello")
+    assert body["thinking"] == {"type": "adaptive", "display": "summarized"}
+
+
+def test_build_anthropic_thinking_string_enabled():
+    client = LLMClient({**CFG, "format": "anthropic", "thinking": "enabled"})
+    _, _, body = client.build_request("hello")
+    assert body["thinking"] == {"type": "enabled", "budget_tokens": 10000}
+
+
+def test_build_anthropic_thinking_dict_passthrough():
+    client = LLMClient({
+        **CFG, "format": "anthropic",
+        "thinking_config": {"type": "enabled", "budget_tokens": 20000},
+    })
+    _, _, body = client.build_request("hello")
+    assert body["thinking"] == {"type": "enabled", "budget_tokens": 20000}
+
+
+def test_build_anthropic_thinking_disabled():
+    client = LLMClient({**CFG, "format": "anthropic", "thinking": "disabled"})
+    _, _, body = client.build_request("hello")
+    assert body["thinking"] == {"type": "disabled"}
+
+
+def test_build_anthropic_effort():
+    client = LLMClient({**CFG, "format": "anthropic", "anthropic_effort": "medium"})
+    _, _, body = client.build_request("hello")
+    assert body["output_config"] == {"effort": "medium"}
+
+
+def test_build_anthropic_no_thinking():
+    client = LLMClient({**CFG, "format": "anthropic"})
+    _, _, body = client.build_request("hello")
+    assert "thinking" not in body
+    assert "output_config" not in body
+
+
+def test_invalid_thinking_raises():
+    with pytest.raises(LLMError):
+        LLMClient({**CFG, "thinking": "bogus"})
+
+
+def test_invalid_reasoning_effort_raises():
+    with pytest.raises(LLMError):
+        LLMClient({**CFG, "reasoning_effort": "ultra"})
+
+
+def test_invalid_anthropic_effort_raises():
+    with pytest.raises(LLMError):
+        LLMClient({**CFG, "format": "anthropic", "anthropic_effort": "turbo"})
+
+
+def test_build_anthropic_budget_too_small():
+    with pytest.raises(LLMError):
+        LLMClient({**CFG, "format": "anthropic",
+                   "thinking_config": {"type": "enabled", "budget_tokens": 100}})
+
+
+def test_extract_openai_chat_reasoning_fallback():
+    data = {"choices": [{"message": {"content": None, "reasoning_content": "think..."}}]}
+    assert LLMClient.extract_reply("openai_chat", data) == "think..."
+
+
+def test_extract_anthropic_thinking_fallback():
+    data = {"content": [
+        {"type": "thinking", "thinking": "plan..."},
+        {"type": "text", "text": "final answer"},
+    ]}
+    assert LLMClient.extract_reply("anthropic", data) == "final answer"
+
+
+def test_extract_anthropic_thinking_only():
+    data = {"content": [{"type": "thinking", "thinking": "plan..."}]}
+    assert LLMClient.extract_reply("anthropic", data) == "plan..."
