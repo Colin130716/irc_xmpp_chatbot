@@ -4,7 +4,7 @@
 
 ## 功能
 
-- TLS 连接（IRC / XMPP / server↔client 三条链路）
+- TLS 连接：IRC/XMPP 各自配置；server↔client 可选（`tls.enabled` 控制，默认启用，`enabled: false` 走明文）
 - LLM API：OpenAI Chat Completions / OpenAI Responses / Anthropic Messages 三种格式
 - LLM 思考控制：thinking 开关（三格式）+ DeepSeek reasoning_effort + Anthropic output_config.effort
 - 配置文件热重载（server.yaml 权限/LLM 段）

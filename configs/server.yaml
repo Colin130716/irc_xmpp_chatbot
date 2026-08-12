@@ -4,6 +4,7 @@ server:
   tls:
     certfile: server.crt
     keyfile: server.key
+    # enabled: true   # 默认启用；设 false 则走明文（不启用 TLS）
   token: "change-me-shared-secret"
   oper_cache_ttl: 60
   shellop_confirm_timeout: 60

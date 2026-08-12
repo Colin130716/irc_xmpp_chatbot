@@ -6,4 +6,5 @@ client:
     token: "change-me-shared-secret"
     tls:
       verify: false
+      # enabled: true   # 默认启用；设 false 则走明文（不启用 TLS，需与 server 一致）
 root_session_ttl: 300

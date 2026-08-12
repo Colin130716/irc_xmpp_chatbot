@@ -27,6 +27,7 @@ $PY -m ircxmppbot client configs/client.yaml   # 启动 shell 执行器
 ## 架构
 
 - **server.py（BotServer）**：中枢。持有 botop/shellop/黑白名单、oper 缓存（WHOIS 313 上报）、shellop 确认投票编排、runcmd 跨 client 路由、LLM 调用。权限命令生效时**原子写回 server.yaml**（tmp + `os.replace`），热重载以文件为准。
+- server↔client TLS 可选：`tls.enabled` 统一判定（默认启用，`enabled: false` 走明文；server 缺 certfile 启动报错；握手失败日志提示检查两端配置）
 - **irc_session.py（IRCSession，pydle）**：server 内嵌的 IRC 连接（ChatTarget 实现）。命令解析转发、oper WHOIS、黑白名单 JOIN 踢人、shellop 投票私信（`dm_voters`）。
 - **xmpp_session.py（XMPPSession，slixmpp）**：server 内嵌的 XMPP 连接，仅 chat/help（私聊免前缀/群聊带前缀），不参与权限机制。
 - **client.py（ShellClient）**：统一单类型执行器，仅连接 server + 执行 runcmd/getroot。
