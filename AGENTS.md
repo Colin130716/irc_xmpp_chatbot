@@ -8,7 +8,7 @@ IRC + XMPP 双协议聊天机器人（**server 中枢化**架构）。Python 3.1
   - 现成 venv 在 `/tmp/opencode/ircxmppbot-venv`（editable 安装指向本仓库）。
   - 所有测试/运行命令用 `/tmp/opencode/ircxmppbot-venv/bin/pytest` / `.../bin/python`。
   - 若该 venv 缺失：`uv venv /tmp/opencode/ircxmppbot-venv && uv pip install --python /tmp/opencode/ircxmppbot-venv/bin/python -e ".[dev]"`。
-- `.gitignore` 已忽略 `configs/*.crt`、`configs/*.key`——server 的 TLS 证书不可入库。
+- `.gitignore` 已忽略 `configs/*.crt`、`configs/*.key`、`configs/server.yaml`、`configs/client.yaml`——TLS 证书与真实配置不入库，仓库只保留 `configs/*.example.yaml` 示例（部署时 `cp configs/server.example.yaml configs/server.yaml`）。
 
 ## 常用命令
 
@@ -16,10 +16,12 @@ IRC + XMPP 双协议聊天机器人（**server 中枢化**架构）。Python 3.1
 PY=/tmp/opencode/ircxmppbot-venv/bin/python
 P=/tmp/opencode/ircxmppbot-venv/bin/pytest
 
-$P tests/                          # 全量测试（97 个）
+$P tests/                          # 全量测试（131 个）
 $P tests/test_server.py -v         # 单文件
 $P tests/test_server.py::test_cmd_chat_uses_llm -v   # 单个测试
 $PY -m ircxmppbot --help           # CLI 两个子命令：server / client
+cp configs/server.example.yaml configs/server.yaml   # 部署前从示例复制（或直接用 example 跑通）
+cp configs/client.example.yaml configs/client.yaml
 $PY -m ircxmppbot server configs/server.yaml   # 启动 server（自动连 IRC/XMPP，需真实参数）
 $PY -m ircxmppbot client configs/client.yaml   # 启动 shell 执行器
 ```

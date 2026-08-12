@@ -5,3 +5,5 @@ __pycache__/
 .venv/
 configs/*.crt
 configs/*.key
+configs/server.yaml
+configs/client.yaml

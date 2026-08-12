@@ -23,7 +23,10 @@ openssl req -x509 -newkey rsa:2048 -nodes \
   -keyout configs/server.key -out configs/server.crt -days 365 \
   -subj "/CN=localhost"
 
-# 2. 编辑 configs/server.yaml（IRC/XMPP/LLM/权限 全部集中于此）
+# 2. 从示例复制并编辑配置（IRC/XMPP/LLM/权限 全部集中于 server.yaml）
+cp configs/server.example.yaml configs/server.yaml
+cp configs/client.example.yaml configs/client.yaml
+#    编辑 configs/server.yaml（server 端配置）
 #    编辑 configs/client.yaml（shell 执行器连接参数）
 
 # 3. 启动 server（自动连接配置中的 IRC/XMPP 段）

@@ -5,14 +5,14 @@ from ircxmppbot.protocol import decode_msg, encode_msg, make_auth
 
 
 def test_sample_server_config_loads():
-    cfg = load_yaml(Path("configs/server.yaml"))
+    cfg = load_yaml(Path("configs/server.example.yaml"))
     assert "server" in cfg and "permissions" in cfg
     assert "listen_port" in cfg["server"]
     assert "whitelist" in cfg["permissions"] and "blacklist" in cfg["permissions"]
 
 
 def test_sample_client_config_loads():
-    cfg = load_yaml(Path("configs/client.yaml"))
+    cfg = load_yaml(Path("configs/client.example.yaml"))
     assert "client" in cfg
     assert "name" in cfg["client"]
     assert "server" in cfg["client"]
@@ -20,7 +20,7 @@ def test_sample_client_config_loads():
 
 
 def test_server_config_has_irc_or_xmpp():
-    cfg = load_yaml(Path("configs/server.yaml"))
+    cfg = load_yaml(Path("configs/server.example.yaml"))
     # irc/xmpp 段可选：样例中至少有一个
     assert "irc" in cfg or "xmpp" in cfg
 
