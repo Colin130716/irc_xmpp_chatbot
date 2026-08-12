@@ -51,3 +51,10 @@ def match_mask(hostmask: str, mask: str) -> bool:
 def backoff_delay(attempt: int, cap: float = 60.0) -> float:
     """指数退避：2**attempt，封顶 cap 秒。attempt 从 0 开始。"""
     return min(2**attempt, cap)
+
+
+def tls_enabled(tls_cfg: dict | None) -> bool:
+    """server↔client 链路 TLS 启用判定：无段→False；段存在→默认启用，enabled:false 显式禁用。"""
+    if not tls_cfg:
+        return False
+    return bool(tls_cfg.get("enabled", True))

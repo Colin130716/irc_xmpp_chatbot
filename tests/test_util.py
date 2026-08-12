@@ -1,4 +1,6 @@
-from ircxmppbot.util import backoff_delay, match_mask, parse_userhost, split_text, split_text_bytes
+from ircxmppbot.util import (
+    backoff_delay, match_mask, parse_userhost, split_text, split_text_bytes, tls_enabled,
+)
 
 
 def test_split_text_short_unchanged():
@@ -66,3 +68,20 @@ def test_split_text_bytes_mixed():
 
 def test_split_text_bytes_empty():
     assert split_text_bytes("", 10) == []
+
+
+def test_tls_enabled_missing_section():
+    assert tls_enabled(None) is False
+    assert tls_enabled({}) is False
+
+
+def test_tls_enabled_section_default_true():
+    assert tls_enabled({"verify": False}) is True
+
+
+def test_tls_enabled_explicit_false():
+    assert tls_enabled({"enabled": False}) is False
+
+
+def test_tls_enabled_explicit_true():
+    assert tls_enabled({"enabled": True, "verify": False}) is True
