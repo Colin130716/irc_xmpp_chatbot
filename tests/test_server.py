@@ -1,12 +1,14 @@
 import asyncio
+import logging
+import ssl
 import time
 from pathlib import Path
 
 import pytest
 
-from ircxmppbot.config import load_yaml
+from ircxmppbot.config import ConfigError, ConfigWatcher, load_yaml
 from ircxmppbot.protocol import make_runcmd_result
-from ircxmppbot.server import BotServer
+from ircxmppbot.server import BotServer, build_server_ssl_ctx
 
 
 class FakeConn:
@@ -349,3 +351,96 @@ async def test_getroot_requires_client_name(srv):
     srv.permissions.shellop.add("boss@host.example")
     await _cmd(srv, target, "runcmd", ["getroot", "secretpw"], "boss@host.example")
     assert "用法" in _last(target)[0]
+
+
+# ---------- TLS 可选（统一判定） ----------
+
+class SSLFailReader:
+    async def readline(self):
+        raise ssl.SSLError("wrong version number")
+
+
+class FakeWriter:
+    def __init__(self):
+        self.closed = False
+        self.sent = []
+
+    def close(self):
+        self.closed = True
+
+    async def wait_closed(self):
+        return None
+
+    def write(self, data):
+        self.sent.append(data)
+
+    async def drain(self):
+        return None
+
+
+class FakeTCPServer:
+    async def serve_forever(self):
+        return None
+
+
+def test_build_server_ssl_ctx_disabled():
+    assert build_server_ssl_ctx(None, Path(".")) is None
+    assert build_server_ssl_ctx({"enabled": False}, Path(".")) is None
+
+
+def test_build_server_ssl_ctx_missing_certfile():
+    with pytest.raises(ConfigError):
+        build_server_ssl_ctx({"enabled": True}, Path("."))
+
+
+def test_build_server_ssl_ctx_ok(monkeypatch, tmp_path):
+    def fake_load(self, certfile, keyfile=None):
+        self._loaded = (certfile, keyfile)
+
+    monkeypatch.setattr(ssl.SSLContext, "load_cert_chain", fake_load)
+    (tmp_path / "server.crt").write_text("crt")
+    (tmp_path / "server.key").write_text("key")
+    ctx = build_server_ssl_ctx(
+        {"enabled": True, "certfile": "server.crt", "keyfile": "server.key"}, tmp_path
+    )
+    assert ctx is not None
+    assert ctx._loaded == (str(tmp_path / "server.crt"), str(tmp_path / "server.key"))
+
+
+async def test_run_tls_disabled_listens_plain(monkeypatch, tmp_path):
+    server = BotServer(_write_cfg(tmp_path))
+    server.reload(load_yaml(server.config_path))
+    captured = {}
+
+    async def fake_start_server(handler, host, port, ssl=None):
+        captured["ssl"] = ssl
+        return FakeTCPServer()
+
+    async def fake_watcher_run(self):
+        return None
+
+    def fake_watcher_stop(self):
+        return None
+
+    monkeypatch.setattr(asyncio, "start_server", fake_start_server)
+    monkeypatch.setattr(ConfigWatcher, "run", fake_watcher_run)
+    monkeypatch.setattr(ConfigWatcher, "stop", fake_watcher_stop)
+    await server.run()
+    assert captured["ssl"] is None
+
+
+async def test_run_tls_enabled_missing_certfile_raises(tmp_path):
+    cfg = load_yaml(_write_cfg(tmp_path))
+    cfg["server"]["tls"] = {"enabled": True}
+    p = tmp_path / "server.yaml"
+    p.write_text(_yaml(cfg), encoding="utf-8")
+    server = BotServer(p)
+    server.reload(load_yaml(server.config_path))
+    with pytest.raises(ConfigError):
+        await server.run()
+
+
+async def test_handle_client_tls_mismatch_logs_hint(srv, caplog):
+    with caplog.at_level(logging.WARNING):
+        await srv._handle_client(SSLFailReader(), FakeWriter())
+    assert "tls.enabled" in caplog.text

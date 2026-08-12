@@ -23,13 +23,30 @@ from .protocol import (
     make_getroot,
     make_runcmd,
 )
-from .util import parse_userhost
+from .util import parse_userhost, tls_enabled
 from .xmpp_session import XMPPSession
 
 log = logging.getLogger(__name__)
 
 AUTH_TIMEOUT = 10.0
 RUNCMD_TIMEOUT = 300.0
+
+
+def build_server_ssl_ctx(tls_cfg: dict | None, config_dir: Path) -> ssl.SSLContext | None:
+    """构建 server 端 SSLContext；TLS 未启用返回 None。启用但缺 certfile 抛 ConfigError。"""
+    if not tls_enabled(tls_cfg):
+        return None
+    if not tls_cfg.get("certfile"):
+        raise ConfigError("server tls 已启用但缺少 certfile")
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    certfile = tls_cfg["certfile"]
+    keyfile = tls_cfg.get("keyfile")
+    if not Path(certfile).is_absolute():
+        certfile = str(config_dir / certfile)
+    if keyfile and not Path(keyfile).is_absolute():
+        keyfile = str(config_dir / keyfile)
+    ctx.load_cert_chain(certfile, keyfile)
+    return ctx
 
 
 class ChatTarget:
@@ -101,18 +118,7 @@ class BotServer:
         srv = self.cfg["server"]
         host = srv.get("listen_host", "0.0.0.0")
         port = int(srv.get("listen_port", 8443))
-        tls_cfg = srv.get("tls", {})
-        ssl_ctx = None
-        if tls_cfg and tls_cfg.get("certfile"):
-            ssl_ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
-            cfg_dir = self.config_path.parent
-            certfile = tls_cfg["certfile"]
-            keyfile = tls_cfg.get("keyfile")
-            if not Path(certfile).is_absolute():
-                certfile = str(cfg_dir / certfile)
-            if keyfile and not Path(keyfile).is_absolute():
-                keyfile = str(cfg_dir / keyfile)
-            ssl_ctx.load_cert_chain(certfile, keyfile)
+        ssl_ctx = build_server_ssl_ctx(srv.get("tls"), self.config_path.parent)
         server = await asyncio.start_server(self._handle_client, host, port, ssl=ssl_ctx)
         log.info("server 监听 %s:%s (TLS=%s)", host, port, ssl_ctx is not None)
         watcher = ConfigWatcher(self.config_path, self._on_config_change)
@@ -178,6 +184,8 @@ class BotServer:
                     log.warning("协议错误: %s", e)
                     continue
                 await self._dispatch(conn, msg)
+        except ssl.SSLError as e:
+            log.warning("TLS 握手失败（client 可能未启用 TLS，请检查两端 tls.enabled 配置是否一致）: %s", e)
         except (ConnectionError, asyncio.IncompleteReadError, TimeoutError, OSError):
             pass
         finally:
