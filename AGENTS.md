@@ -49,6 +49,7 @@ $PY -m ircxmppbot client configs/client.yaml   # 启动 shell 执行器
 
 - **pydle 1.1**：JOIN 事件处理器是 `on_join`（不是 `on_user_join`）；未连接时 `self.nickname` 是 `"<unregistered>"`（配置昵称在 `self._nicknames[0]`）；断线自动重连（RECONNECT_ON_ERROR）。
 - **slixmpp ≥1.9 已移除 `process()`**——用 `await self.disconnected`；`XMLStream.disconnected` 是文档化的 Future。
+- LLM 思考配置（llm.py）：`thinking`（enabled/disabled/adaptive，三格式）、`reasoning_effort`（仅 OpenAI 兼容）、`thinking_config`（anthropic dict 透传）、`anthropic_effort`（→ output_config.effort）；不配置则不发
 - **slixmpp `server` property**：slixmpp 有 `server` 属性 setter，自定义属性**不可命名 `server`**——XMPPSession 用 `self.srv` 存 server 引用。
 - **su --pty**：getroot 依赖 util-linux 的 `--pty`（macOS 的 su 不支持）；密码走 `create_subprocess_exec` 的 stdin（不进 argv，`ps` 不可见）。
 

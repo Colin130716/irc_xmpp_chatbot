@@ -6,6 +6,7 @@
 
 - TLS 连接（IRC / XMPP / server↔client 三条链路）
 - LLM API：OpenAI Chat Completions / OpenAI Responses / Anthropic Messages 三种格式
+- LLM 思考控制：thinking 开关（三格式）+ DeepSeek reasoning_effort + Anthropic output_config.effort
 - 配置文件热重载（server.yaml 权限/LLM 段）
 - IRC 端完整权限体系：botop / oper / shellop / 黑白名单
 - 跨 client 远程 shell 执行：`!<bot_name> runcmd <client_name> <cmd>`

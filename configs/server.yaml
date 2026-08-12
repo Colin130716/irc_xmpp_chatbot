@@ -38,6 +38,12 @@ llm:
   max_tokens: 1000
   timeout: 60
   max_reply_chars: 1500
+  # thinking: enabled            # enabled/disabled/adaptive（三格式通用，可选）
+  # reasoning_effort: high       # low/high/max，仅 openai_chat/openai_responses
+  # thinking_config:             # 仅 anthropic：dict 透传（如 {type: adaptive, display: summarized}）
+  #   type: adaptive
+  #   display: summarized
+  # anthropic_effort: medium     # 仅 anthropic（→ output_config.effort）
 
 permissions:
   botop:
